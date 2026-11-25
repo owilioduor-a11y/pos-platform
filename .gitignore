@@ -1,0 +1,55 @@
+# ==========================================
+# SECRETS & ENVIRONMENT FILES
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.jks
+*.keystore
+local.properties
+google-services.json
+
+# ==========================================
+# RUST & CARGO
+# ==========================================
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# ==========================================
+# LOCAL DATABASES (SQLITE OFFLINE TESTS)
+# ==========================================
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# ANDROID & GRADLE
+# ==========================================
+android/.gradle/
+android/build/
+android/*/build/
+android/captures/
+android/.cxx/
+android/.externalNativeBuild/
+android/app/src/main/jniLibs/**/*.so
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# ==========================================
+# IDES & OS ARTIFACTS
+# ==========================================
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.iml
+.DS_Store
+Thumbs.db
