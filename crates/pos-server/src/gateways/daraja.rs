@@ -74,10 +74,8 @@ impl DarajaClient {
 
         let token = self.access_token().await?;
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let password = base64::engine::general_purpose::STANDARD.encode(format!(
-            "{}{}{}",
-            self.shortcode, self.passkey, timestamp
-        ));
+        let password = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}{}{}", self.shortcode, self.passkey, timestamp));
         // Daraja expects whole KES for STK push amounts.
         let amount_kes = req.amount.amount_minor / 100;
 
@@ -97,10 +95,7 @@ impl DarajaClient {
 
         let resp = self
             .http
-            .post(format!(
-                "{}/mpesa/stkpush/v1/processrequest",
-                self.base_url
-            ))
+            .post(format!("{}/mpesa/stkpush/v1/processrequest", self.base_url))
             .bearer_auth(token)
             .json(&body)
             .send()

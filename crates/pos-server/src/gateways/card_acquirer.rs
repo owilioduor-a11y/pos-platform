@@ -25,16 +25,12 @@ pub struct CardAcquirerClient {
 
 impl CardAcquirerClient {
     pub fn new(config: &Config) -> Self {
-        let mock =
-            config.kenya_acquirer_provider == "mock" || config.kenya_acquirer_api_url.is_empty();
+        let mock = config.acquirer_provider == "mock" || config.acquirer_api_url.is_empty();
         Self {
             http: reqwest::Client::new(),
-            api_url: config
-                .kenya_acquirer_api_url
-                .trim_end_matches('/')
-                .to_string(),
-            api_key: config.kenya_acquirer_api_key.clone(),
-            webhook_secret: config.kenya_acquirer_webhook_secret.clone(),
+            api_url: config.acquirer_api_url.trim_end_matches('/').to_string(),
+            api_key: config.acquirer_api_key.clone(),
+            webhook_secret: config.acquirer_webhook_secret.clone(),
             provider_name: "kenya_acquirer",
             mock,
         }

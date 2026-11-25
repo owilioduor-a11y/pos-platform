@@ -45,7 +45,7 @@ fn row_to_product(row: &sqlx::postgres::PgRow) -> ApiResult<ProductResponse> {
         name: row.get("name"),
         price_minor: row.get("price_minor"),
         currency: row.get("currency"),
-        tax_rate: row.get::<Decimal, _>("tax_rate").to_string(),
+        tax_rate: row.get::<String, _>("tax_rate"),
         stock_qty: row.get("stock_qty"),
         active: row.get("active"),
     })
@@ -58,14 +58,16 @@ pub async fn list_products(
 ) -> ApiResult<Json<Vec<ProductResponse>>> {
     let pool = state.pool.clone();
     let rows = sqlx::query(
-        "SELECT id, sku, barcode, name, price_minor, currency, tax_rate, stock_qty, active
+        "SELECT id, sku, barcode, name, price_minor, currency, tax_rate::text AS tax_rate, stock_qty, active
          FROM products WHERE merchant_id = $1 AND active = TRUE
          ORDER BY name",
     )
     .bind(user.merchant_id)
     .fetch_all(&pool)
     .await?;
-    Ok(Json(rows.iter().map(row_to_product).collect::<ApiResult<_>>()?))
+    Ok(Json(
+        rows.iter().map(row_to_product).collect::<ApiResult<_>>()?,
+    ))
 }
 
 /// POST /api/v1/catalog/products — upsert a product (catalog push from HQ
@@ -98,7 +100,7 @@ pub async fn upsert_product(
     let row = sqlx::query(
         "INSERT INTO products
             (id, merchant_id, sku, barcode, name, price_minor, currency, tax_rate, stock_qty, active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9, $10)
          ON CONFLICT (merchant_id, sku) DO UPDATE SET
             barcode    = excluded.barcode,
             name       = excluded.name,
@@ -108,7 +110,7 @@ pub async fn upsert_product(
             stock_qty  = excluded.stock_qty,
             active     = excluded.active,
             updated_at = now()
-         RETURNING id, sku, barcode, name, price_minor, currency, tax_rate, stock_qty, active",
+         RETURNING id, sku, barcode, name, price_minor, currency, tax_rate::text AS tax_rate, stock_qty, active",
     )
     .bind(Uuid::now_v7())
     .bind(user.merchant_id)
@@ -117,7 +119,7 @@ pub async fn upsert_product(
     .bind(req.name.trim())
     .bind(req.price_minor)
     .bind(&currency)
-    .bind(tax_rate)
+    .bind(tax_rate.to_string())
     .bind(req.stock_qty)
     .bind(req.active.unwrap_or(true))
     .fetch_one(&pool)

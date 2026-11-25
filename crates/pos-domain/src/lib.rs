@@ -65,6 +65,9 @@ pub enum DomainError {
         available: u32,
     },
 
+    #[error("payment failed: {0}")]
+    PaymentDeclined(String),
+
     #[error("invalid input: {0}")]
     InvalidInput(String),
 

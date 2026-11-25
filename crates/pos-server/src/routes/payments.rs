@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use pos_domain::money::{Currency, Money};
-use pos_domain::payment::PaymentRequest;
+use pos_domain::payment::{PaymentGateway, PaymentRequest};
 use pos_domain::PaymentMethod;
 use serde::Deserialize;
 use serde_json::json;
@@ -108,19 +108,31 @@ pub async fn mpesa_stkpush(
     if amount.amount_minor <= 0 {
         return Err(ApiError::BadRequest("amount must be positive".into()));
     }
-    let account_ref = req.account_ref.unwrap_or_else(|| user.merchant_id.to_string());
-    let result = state
-        .gateways
-        .mpesa
-        .stk_push(&req.phone, &amount, &account_ref, "POS sale")
-        .await
-        .map_err(|e| ApiError::PaymentFailed(e.to_string()))?;
+    let account_ref = req
+        .account_ref
+        .unwrap_or_else(|| user.merchant_id.to_string());
+
+    // Reuse the standard charge path — DarajaClient::stk_push is invoked
+    // through the PaymentGateway impl for PaymentMethod::Mpesa.
+    let request = PaymentRequest {
+        amount,
+        merchant_id: user.merchant_id,
+        idempotency_key: Uuid::now_v7(),
+        method: PaymentMethod::Mpesa,
+        mpesa_phone: Some(req.phone),
+        card_token: None,
+    };
+    let receipt = state.gateways.charge(&request).await?;
+    let payload = receipt.raw_provider_payload;
 
     Ok(Json(json!({
-        "merchant_request_id": result.merchant_request_id,
-        "checkout_request_id": result.checkout_request_id,
-        "response_code": result.response_code,
-        "response_description": result.response_description,
+        "approved": receipt.approved,
+        "reference": receipt.reference,
+        "merchant_request_id": payload.get("MerchantRequestID"),
+        "checkout_request_id": payload.get("CheckoutRequestID"),
+        "response_code": payload.get("ResponseCode"),
+        "response_description": payload.get("ResponseDescription"),
+        "account_ref": account_ref,
     })))
 }
 
@@ -156,7 +168,9 @@ pub async fn daraja_webhook(
     .await?;
 
     if result.rows_affected() == 0 {
-        return Ok(Json(json!({ "ResultCode": 0, "ResultDesc": "duplicate ignored" })));
+        return Ok(Json(
+            json!({ "ResultCode": 0, "ResultDesc": "duplicate ignored" }),
+        ));
     }
 
     // Extract payment outcome for ledger reconciliation.
@@ -169,7 +183,8 @@ pub async fn daraja_webhook(
         .and_then(|s| s.pointer("/CallbackMetadata/Item"))
         .and_then(|items| items.as_array())
         .and_then(|arr| {
-            arr.iter().find(|i| i.get("Name").and_then(|n| n.as_str()) == Some("MpesaReceiptNumber"))
+            arr.iter()
+                .find(|i| i.get("Name").and_then(|n| n.as_str()) == Some("MpesaReceiptNumber"))
         })
         .and_then(|i| i.get("Value"))
         .and_then(|v| v.as_str())
@@ -187,15 +202,20 @@ pub async fn acquirer_webhook(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let pool = state.pool.clone();
-    let gateways = &state.gateways;
+    let acquirer = state.gateways.card.as_ref().ok_or(ApiError::PaymentFailed(
+        "card acquirer not configured".into(),
+    ))?;
     let header_pairs: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
         .collect();
-    let verified = gateways
-        .card
+    let verified = acquirer
         .verify_webhook(&header_pairs, &body)
-        .map_err(|e| ApiError::Unauthorized)?;
+        .map_err(|_| ApiError::Unauthorized)?;
     if !verified {
         return Err(ApiError::Unauthorized);
     }

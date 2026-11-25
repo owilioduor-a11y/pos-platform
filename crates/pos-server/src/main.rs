@@ -68,7 +68,10 @@ fn build_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .route("/auth/register", post(routes::auth::register))
         .route("/auth/login", post(routes::auth::login))
         .route("/webhooks/daraja", post(routes::payments::daraja_webhook))
-        .route("/webhooks/acquirer", post(routes::payments::acquirer_webhook));
+        .route(
+            "/webhooks/acquirer",
+            post(routes::payments::acquirer_webhook),
+        );
 
     // JWT-protected merchant endpoints.
     let protected = Router::new()
@@ -88,10 +91,7 @@ fn build_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
             "/payments/mpesa/stkpush",
             post(routes::payments::mpesa_stkpush),
         )
-        .layer(middleware::from_fn_with_state(
-            config,
-            auth::require_auth,
-        ));
+        .layer(middleware::from_fn_with_state(config, auth::require_auth));
 
     Router::new()
         .nest("/api/v1", public.merge(protected))

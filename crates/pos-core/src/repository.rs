@@ -30,7 +30,7 @@ pub async fn upsert_product(pool: &SqlitePool, product: &Product) -> anyhow::Res
     .bind(product.price.amount_minor)
     .bind(&product.price.currency.code)
     .bind(product.tax_rate.to_string())
-    .bind(product.stock_qty.map(|q| i64::from(q)))
+    .bind(product.stock_qty.map(i64::from))
     .bind(i64::from(product.active))
     .execute(pool)
     .await?;
@@ -132,11 +132,10 @@ pub async fn enqueue_outbox(
     kind: &str,
     payload_json: &str,
 ) -> anyhow::Result<i64> {
-    let result =
-        sqlx::query("INSERT INTO sync_outbox (kind, payload_json) VALUES (?, ?)")
-            .bind(kind)
-            .bind(payload_json)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query("INSERT INTO sync_outbox (kind, payload_json) VALUES (?, ?)")
+        .bind(kind)
+        .bind(payload_json)
+        .execute(pool)
+        .await?;
     Ok(result.last_insert_rowid())
 }

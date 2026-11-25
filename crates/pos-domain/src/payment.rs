@@ -1,5 +1,5 @@
 use crate::money::Money;
-use crate::{DomainError, DomainResult};
+use crate::DomainResult;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -64,7 +64,9 @@ pub async fn register(
         .unwrap_or_else(|| "KES".into())
         .to_ascii_uppercase();
     if currency.len() != 3 {
-        return Err(ApiError::BadRequest("currency_code must be ISO 4217".into()));
+        return Err(ApiError::BadRequest(
+            "currency_code must be ISO 4217".into(),
+        ));
     }
 
     let merchant_id = Uuid::now_v7();

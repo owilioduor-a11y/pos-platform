@@ -13,6 +13,7 @@ pub enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[allow(dead_code)]
     #[error("forbidden")]
     Forbidden,
 
@@ -26,7 +27,7 @@ pub enum ApiError {
     PaymentFailed(String),
 
     #[error("internal error")]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
 }
 
 impl ApiError {
@@ -67,6 +68,12 @@ impl IntoResponse for ApiError {
             }
         }));
         (self.status(), body).into_response()
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
     }
 }
 

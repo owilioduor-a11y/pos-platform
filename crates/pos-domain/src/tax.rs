@@ -80,9 +80,7 @@ impl TaxEngine {
             }
             TaxMode::Exclusive => {
                 // tax = net * rate; gross = net + tax
-                let tax = minor
-                    .checked_mul(rate)
-                    .ok_or(DomainError::MoneyOverflow)?;
+                let tax = minor.checked_mul(rate).ok_or(DomainError::MoneyOverflow)?;
                 let tax_minor = round_minor(tax)?;
                 let gross_minor = amount
                     .amount_minor

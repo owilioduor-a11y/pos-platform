@@ -1,9 +1,9 @@
 use crate::auth::AuthUser;
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 use axum::extract::State;
 use axum::Json;
-use pos_domain::payment::PaymentMethod;
 use pos_domain::sale::Sale;
+use pos_domain::PaymentMethod;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -15,6 +15,9 @@ use crate::AppState;
 /// Batch item pushed by pos-core's sync outbox.
 #[derive(Debug, Deserialize)]
 pub struct SyncItem {
+    /// Outbox row id from the device — used for tracing only; dedupe is
+    /// handled by the sales.idempotency_key UNIQUE constraint.
+    #[allow(dead_code)]
     pub id: i64,
     pub kind: String,
     pub payload: serde_json::Value,

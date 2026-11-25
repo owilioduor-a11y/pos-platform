@@ -42,16 +42,27 @@ pub async fn push_pending(
         synced += rows.len();
 
         // Partition by destination endpoint.
-        let (sales, events): (Vec<_>, Vec<_>) =
-            rows.into_iter().partition(|r| r.kind == "sale");
+        let (sales, events): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.kind == "sale");
 
         if !sales.is_empty() {
-            post_batch(pool, &client, &format!("{base}/api/v1/sync/sales"), api_token, sales)
-                .await?;
+            post_batch(
+                pool,
+                &client,
+                &format!("{base}/api/v1/sync/sales"),
+                api_token,
+                sales,
+            )
+            .await?;
         }
         if !events.is_empty() {
-            post_batch(pool, &client, &format!("{base}/api/v1/sync/events"), api_token, events)
-                .await?;
+            post_batch(
+                pool,
+                &client,
+                &format!("{base}/api/v1/sync/events"),
+                api_token,
+                events,
+            )
+            .await?;
         }
     }
 }
@@ -86,8 +97,7 @@ async fn post_batch(
         .map(|r| OutboxItem {
             id: r.id,
             kind: r.kind.clone(),
-            payload: serde_json::from_str(&r.payload_json)
-                .unwrap_or(serde_json::Value::Null),
+            payload: serde_json::from_str(&r.payload_json).unwrap_or(serde_json::Value::Null),
         })
         .collect();
 

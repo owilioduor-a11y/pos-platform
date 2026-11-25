@@ -1,10 +1,10 @@
 # Product & Engineering Roadmap
 
 ## Phase 1: Offline Core & Sandbox MVP (Weeks 1–4)
-- [ ] `pos-domain`: Money math, 16% VAT engine, cart, split payments, and payment traits.
-- [ ] `pos-server`: Axum API, PostgreSQL ledger, JWT auth, and Safaricom Daraja sandbox STK Push.
-- [ ] `pos-core`: Offline SQLite store, UUIDv7 sync queue, and UniFFI bindings.
-- [ ] `android/`: Jetpack Compose UI (Quick Charge + Retail Catalog) with mock 2-second NFC tap.
+- [x] `pos-domain`: Money math, 16% VAT engine, cart, split payments, and payment traits.
+- [x] `pos-server`: Axum API, PostgreSQL ledger, JWT auth, and Safaricom Daraja sandbox STK Push.
+- [x] `pos-core`: Offline SQLite store, UUIDv7 sync queue, and UniFFI bindings.
+- [x] `android/`: Jetpack Compose UI (Quick Charge + Retail Catalog) with mock 2-second NFC tap.
 
 ## Phase 2: Kenya Pilot & Certification (Weeks 5–10)
 - [ ] Complete Kenyan Private Limited Company (Ltd) registration and corporate bank account.

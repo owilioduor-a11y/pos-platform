@@ -35,7 +35,7 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| ApiError::Internal(e.into()))
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("argon2 hash failed: {e}")))
 }
 
 pub fn verify_password(hash: &str, password: &str) -> bool {
@@ -47,7 +47,12 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
     }
 }
 
-pub fn issue_token(config: &Config, user_id: Uuid, merchant_id: Uuid, role: &str) -> ApiResult<String> {
+pub fn issue_token(
+    config: &Config,
+    user_id: Uuid,
+    merchant_id: Uuid,
+    role: &str,
+) -> ApiResult<String> {
     let now = chrono_like_now();
     let claims = Claims {
         sub: user_id.to_string(),
@@ -108,7 +113,6 @@ pub async fn require_auth(
     Ok(next.run(req).await)
 }
 
-#[async_trait::async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,

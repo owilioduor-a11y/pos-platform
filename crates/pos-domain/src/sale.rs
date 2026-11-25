@@ -1,7 +1,7 @@
 use crate::catalog::Product;
 use crate::money::Money;
-use crate::payment::PaymentMethod;
 use crate::tax::TaxEngine;
+use crate::PaymentMethod;
 use crate::{DomainError, DomainResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

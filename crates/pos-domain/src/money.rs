@@ -197,10 +197,7 @@ mod tests {
     #[test]
     fn mul_quantity_overflow_safe() {
         let a = Money::new(i64::MAX, Currency::kes()).unwrap();
-        assert!(matches!(
-            a.mul_quantity(2),
-            Err(DomainError::MoneyOverflow)
-        ));
+        assert!(matches!(a.mul_quantity(2), Err(DomainError::MoneyOverflow)));
     }
 
     #[test]

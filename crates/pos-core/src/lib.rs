@@ -12,7 +12,7 @@ use pos_domain::tax::{TaxEngine, TaxMode};
 use pos_domain::{DomainError, PaymentMethod};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use uuid::Uuid;
 
 /// Errors surfaced to the Kotlin/Android binding layer.
@@ -106,6 +106,7 @@ fn parse_funding(raw: &str) -> FundingType {
 
 /// Offline-first POS engine exposed to Android via UniFFI.
 /// All money amounts are integer minor units (e.g. cents).
+#[derive(uniffi::Object)]
 pub struct PosCore {
     pool: SqlitePool,
     runtime: tokio::runtime::Runtime,
@@ -123,7 +124,7 @@ impl PosCore {
         merchant_id: String,
         server_url: String,
         api_token: String,
-    ) -> Result<Self, PosCoreError> {
+    ) -> Result<Arc<Self>, PosCoreError> {
         let merchant_id = merchant_id
             .parse::<Uuid>()
             .map_err(|_| PosCoreError::InvalidInput("merchant_id must be a UUID".into()))?;
@@ -134,14 +135,14 @@ impl PosCore {
         let pool = runtime
             .block_on(db::create_pool(&db_path))
             .map_err(|e| PosCoreError::Database(e.to_string()))?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             pool,
             runtime,
             merchant_id,
             server_url,
             api_token,
             cart: Mutex::new(Cart::new()),
-        })
+        }))
     }
 
     /// Register (upsert) a product into the offline catalog cache.
@@ -213,7 +214,11 @@ impl PosCore {
     }
 
     /// Set an ad-hoc amount for Micro-merchant Quick Charge mode.
-    pub fn set_adhoc_amount(&self, amount_minor: i64, currency_code: String) -> Result<(), PosCoreError> {
+    pub fn set_adhoc_amount(
+        &self,
+        amount_minor: i64,
+        currency_code: String,
+    ) -> Result<(), PosCoreError> {
         let currency = currency_for(&currency_code)?;
         let amount = Money::new(amount_minor, currency).map_err(domain_err)?;
         lock_cart(&self.cart).set_adhoc(amount).map_err(domain_err)
