@@ -1,6 +1,6 @@
 use anyhow::Context;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 const BATCH_SIZE: i64 = 50;
@@ -15,6 +15,15 @@ struct OutboxItem {
 #[derive(Serialize)]
 struct SyncRequest {
     items: Vec<OutboxItem>,
+}
+
+#[derive(Deserialize)]
+struct SyncAck {
+    accepted: usize,
+    #[serde(default)]
+    duplicates: usize,
+    #[serde(default)]
+    rejected: usize,
 }
 
 struct PendingRow {
@@ -119,6 +128,22 @@ async fn post_batch(
         anyhow::bail!("sync failed: {status} {body}");
     }
 
+    // Never delete rows the server did not accept; that would lose sales or
+    // audit events permanently. Leave the batch in place for investigation.
+    let ack: SyncAck = response
+        .json()
+        .await
+        .with_context(|| format!("invalid sync acknowledgement from {url}"))?;
+    if ack.rejected > 0 || ack.accepted + ack.duplicates != rows.len() {
+        anyhow::bail!(
+            "sync rejected {}/{} rows (accepted {}, duplicates {})",
+            ack.rejected,
+            rows.len(),
+            ack.accepted,
+            ack.duplicates
+        );
+    }
+
     for row in &rows {
         sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
             .bind(row.id)
@@ -138,4 +163,17 @@ async fn post_batch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_ack_defaults_duplicates_for_event_batches() {
+        let ack: SyncAck = serde_json::from_str(r#"{"accepted":1,"rejected":0}"#).unwrap();
+        assert_eq!(ack.accepted, 1);
+        assert_eq!(ack.duplicates, 0);
+        assert_eq!(ack.rejected, 0);
+    }
 }

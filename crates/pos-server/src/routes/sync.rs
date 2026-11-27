@@ -65,6 +65,16 @@ pub async fn sync_sales(
             rejected += 1;
             continue;
         }
+        if sale.idempotency_key.get_version_num() != 7 {
+            tracing::warn!(sale_id = %sale.id, "sale idempotency key is not UUIDv7");
+            rejected += 1;
+            continue;
+        }
+        if let Err(e) = sale.validate_payments() {
+            tracing::warn!(sale_id = %sale.id, error = %e, "invalid sale payments");
+            rejected += 1;
+            continue;
+        }
 
         match insert_sale(&pool, &sale, user.user_id).await {
             Ok(true) => accepted += 1,
@@ -83,9 +93,12 @@ pub async fn sync_sales(
     }))
 }
 
-/// Insert a sale + its payment legs. Returns false on idempotency conflict.
+/// Insert a sale + its payment legs atomically.
+/// Returns false on idempotency conflict, with no partial rows written.
 async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<bool> {
     let payload = serde_json::to_value(sale)?;
+    let mut tx: sqlx::Transaction<'_, sqlx::Postgres> = pool.begin().await?;
+
     let result = sqlx::query(
         "INSERT INTO sales (id, merchant_id, cashier_id, idempotency_key, payload_json, status)
          VALUES ($1, $2, $3, $4, $5, 'completed')
@@ -96,7 +109,7 @@ async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<
     .bind(cashier_id)
     .bind(sale.idempotency_key)
     .bind(payload)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -113,9 +126,10 @@ async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<
         .bind(payment.amount.amount_minor)
         .bind(&payment.amount.currency.code)
         .bind(&payment.reference)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(true)
 }
 
@@ -136,9 +150,13 @@ pub async fn sync_events(
 ) -> ApiResult<Json<serde_json::Value>> {
     let pool = state.pool.clone();
     let mut accepted = 0usize;
+    let mut rejected = 0usize;
     for item in req.items {
-        if item.kind == "sale" {
-            continue; // sales must go through /sync/sales
+        if !matches!(item.kind.as_str(), "tap" | "inventory") {
+            // Sales must go through /sync/sales; other kinds are unknown.
+            tracing::warn!(kind = %item.kind, "rejecting unsupported sync event");
+            rejected += 1;
+            continue;
         }
         let result = sqlx::query(
             "INSERT INTO sync_events (merchant_id, kind, payload_json) VALUES ($1, $2, $3)",
@@ -150,8 +168,11 @@ pub async fn sync_events(
         .await;
         match result {
             Ok(_) => accepted += 1,
-            Err(e) => tracing::warn!(error = %e, kind = %item.kind, "event insert failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, kind = %item.kind, "event insert failed");
+                rejected += 1;
+            }
         }
     }
-    Ok(Json(json!({ "accepted": accepted })))
+    Ok(Json(json!({ "accepted": accepted, "rejected": rejected })))
 }
