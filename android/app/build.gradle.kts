@@ -67,4 +67,7 @@ dependencies {
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // UniFFI-generated Kotlin bindings (JNI bridge to pos-core)
+    implementation("net.java.dev.jna:jna:5.15.0@aar")
 }

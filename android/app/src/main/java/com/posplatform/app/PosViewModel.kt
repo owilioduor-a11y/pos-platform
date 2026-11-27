@@ -102,7 +102,7 @@ class PosViewModel : ViewModel() {
         }
         viewModelScope.launch {
             _tapState.value = TapState.WAITING
-            val result = tapManager.charge(totalMinor = total, currency = CURRENCY)
+            val result = tapManager.charge(amountMinor = total, currency = CURRENCY)
             _tapState.value = if (result.approved) TapState.APPROVED else TapState.DECLINED
 
             if (result.approved) {

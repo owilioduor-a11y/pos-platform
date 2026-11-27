@@ -30,6 +30,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify UniFFI Kotlin bindings are current
+        run: |
+          cargo build -p pos-core --lib
+          cargo run -p pos-core --bin uniffi-bindgen -- generate \
+            --library target/debug/libpos_core.so \
+            --language kotlin \
+            --out-dir "$RUNNER_TEMP/uniffi-kotlin" \
+            --no-format
+          git diff --no-index --exit-code \
+            android/app/src/main/java/uniffi/pos_core/pos_core.kt \
+            "$RUNNER_TEMP/uniffi-kotlin/uniffi/pos_core/pos_core.kt"
+
       - name: Build pos-core for Android
         run: |
           cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p pos-core --release
