@@ -117,15 +117,33 @@ async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<
     }
 
     for payment in &sale.payments {
+        // M-Pesa STK Push is confirmed asynchronously; carry the reconciled
+        // intent status forward if a callback already arrived.
+        let status = if payment.method == PaymentMethod::Mpesa {
+            let intent_status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM mpesa_stk_intents WHERE checkout_request_id = $1",
+            )
+            .bind(&payment.reference)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match intent_status.as_deref() {
+                Some("completed") => "approved",
+                Some("failed") => "failed",
+                _ => "pending",
+            }
+        } else {
+            "approved"
+        };
         sqlx::query(
             "INSERT INTO payments (sale_id, method, amount_minor, currency, reference, status)
-             VALUES ($1, $2, $3, $4, $5, 'approved')",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(sale.id)
         .bind(method_str(payment.method))
         .bind(payment.amount.amount_minor)
         .bind(&payment.amount.currency.code)
         .bind(&payment.reference)
+        .bind(status)
         .execute(&mut *tx)
         .await?;
     }

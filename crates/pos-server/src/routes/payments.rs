@@ -91,6 +91,101 @@ fn charge_response(receipt: &PaymentReceipt, provider: &'static str) -> Value {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DarajaCallback {
+    checkout_request_id: String,
+    result_code: i64,
+    receipt_number: Option<String>,
+}
+
+fn mask_phone(phone: &str) -> String {
+    let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() <= 4 {
+        "****".into()
+    } else {
+        format!("****{}", &digits[digits.len() - 4..])
+    }
+}
+
+fn parse_daraja_callback(payload: &Value) -> ApiResult<DarajaCallback> {
+    let stk = payload
+        .pointer("/Body/stkCallback")
+        .ok_or_else(|| ApiError::BadRequest("missing Daraja stkCallback".into()))?;
+    let checkout_request_id = stk
+        .get("CheckoutRequestID")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing Daraja CheckoutRequestID".into()))?
+        .to_string();
+    let result_code = stk
+        .get("ResultCode")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ApiError::BadRequest("missing Daraja ResultCode".into()))?;
+    let receipt_number = stk
+        .pointer("/CallbackMetadata/Item")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("Name").and_then(Value::as_str) == Some("MpesaReceiptNumber"))
+        })
+        .and_then(|item| item.get("Value"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(DarajaCallback {
+        checkout_request_id,
+        result_code,
+        receipt_number,
+    })
+}
+
+struct StkIntent<'a> {
+    merchant_id: Uuid,
+    idempotency_key: Uuid,
+    account_ref: &'a str,
+    amount_minor: i64,
+    currency: &'a str,
+    phone: &'a str,
+    payload: &'a Value,
+}
+
+async fn store_stk_intent(pool: &PgPool, intent: &StkIntent<'_>) -> ApiResult<()> {
+    let (Some(checkout_request_id), Some(merchant_request_id)) = (
+        intent
+            .payload
+            .get("CheckoutRequestID")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty()),
+        intent
+            .payload
+            .get("MerchantRequestID")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty()),
+    ) else {
+        tracing::error!("Daraja accepted STK push without request ids; cannot reconcile callback");
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO mpesa_stk_intents
+            (merchant_id, idempotency_key, checkout_request_id, merchant_request_id,
+             account_ref, amount_minor, currency, phone_masked)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind(intent.merchant_id)
+    .bind(intent.idempotency_key)
+    .bind(checkout_request_id)
+    .bind(merchant_request_id)
+    .bind(intent.account_ref)
+    .bind(intent.amount_minor)
+    .bind(intent.currency)
+    .bind(mask_phone(intent.phone))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Hash the request inputs that affect the provider call. Stored alongside the
 /// attempt so a reused UUIDv7 cannot silently return an unrelated payment.
 fn request_fingerprint(
@@ -310,10 +405,11 @@ pub async fn mpesa_stkpush(
     let account_ref = req
         .account_ref
         .unwrap_or_else(|| user.merchant_id.to_string());
+    let phone = req.phone;
     let fingerprint = request_fingerprint(
         PaymentMethod::Mpesa,
         &amount,
-        Some(&req.phone),
+        Some(&phone),
         None,
         Some(&account_ref),
     )?;
@@ -334,11 +430,11 @@ pub async fn mpesa_stkpush(
     // Reuse the standard charge path — DarajaClient::stk_push is invoked
     // through the PaymentGateway impl for PaymentMethod::Mpesa.
     let request = PaymentRequest {
-        amount,
+        amount: amount.clone(),
         merchant_id: user.merchant_id,
         idempotency_key,
         method: PaymentMethod::Mpesa,
-        mpesa_phone: Some(req.phone),
+        mpesa_phone: Some(phone.clone()),
         card_token: None,
     };
     let receipt = match state.gateways.charge(&request).await {
@@ -349,6 +445,21 @@ pub async fn mpesa_stkpush(
         }
     };
     let payload = receipt.raw_provider_payload;
+    if receipt.approved {
+        store_stk_intent(
+            &state.pool,
+            &StkIntent {
+                merchant_id: user.merchant_id,
+                idempotency_key,
+                account_ref: &account_ref,
+                amount_minor: amount.amount_minor,
+                currency: &amount.currency.code,
+                phone: &phone,
+                payload: &payload,
+            },
+        )
+        .await?;
+    }
     let response = json!({
         "approved": receipt.approved,
         "reference": receipt.reference,
@@ -364,7 +475,9 @@ pub async fn mpesa_stkpush(
 }
 
 /// POST /api/v1/webhooks/daraja — Safaricom STK callback.
-/// Public route (no JWT): authenticity comes from TLS + payload shape.
+/// Public route: Safaricom callbacks are unsigned, so the result is accepted
+/// only when the CheckoutRequestID matches a stored STK intent. Replays are
+/// deduped by that same id.
 pub async fn daraja_webhook(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -372,24 +485,13 @@ pub async fn daraja_webhook(
     let pool = state.pool.clone();
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("invalid JSON body".into()))?;
-
-    // Extract dedupe key: CheckoutRequestID or MerchantRequestID.
-    let event_id = parsed
-        .pointer("/Body/stkCallback/CheckoutRequestID")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            parsed
-                .pointer("/Body/stkCallback/MerchantRequestID")
-                .and_then(|v| v.as_str())
-        })
-        .ok_or_else(|| ApiError::BadRequest("missing Daraja callback request id".into()))?
-        .to_string();
+    let callback = parse_daraja_callback(&parsed)?;
 
     let result = sqlx::query(
         "INSERT INTO webhook_events (provider, event_id, payload_json) VALUES ('daraja', $1, $2)
          ON CONFLICT (provider, event_id) DO NOTHING",
     )
-    .bind(&event_id)
+    .bind(&callback.checkout_request_id)
     .bind(&parsed)
     .execute(&pool)
     .await?;
@@ -400,24 +502,45 @@ pub async fn daraja_webhook(
         ));
     }
 
-    // Extract payment outcome for ledger reconciliation.
-    let stk = parsed.pointer("/Body/stkCallback");
-    let result_code = stk
-        .and_then(|s| s.get("ResultCode"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(-1);
-    let receipt = stk
-        .and_then(|s| s.pointer("/CallbackMetadata/Item"))
-        .and_then(|items| items.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|i| i.get("Name").and_then(|n| n.as_str()) == Some("MpesaReceiptNumber"))
-        })
-        .and_then(|i| i.get("Value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    tracing::info!(result_code, receipt, "daraja callback received");
+    let (intent_status, payment_status) = if callback.result_code == 0 {
+        ("completed", "approved")
+    } else {
+        ("failed", "failed")
+    };
+    let updated = sqlx::query(
+        "UPDATE mpesa_stk_intents
+         SET status = $2, result_code = $3, receipt_number = $4, updated_at = now()
+         WHERE checkout_request_id = $1",
+    )
+    .bind(&callback.checkout_request_id)
+    .bind(intent_status)
+    .bind(callback.result_code)
+    .bind(&callback.receipt_number)
+    .execute(&pool)
+    .await?;
+    // The sale may sync before or after the callback, so reconcile both sides.
+    let payment_updates = sqlx::query(
+        "UPDATE payments SET status = $2
+         WHERE method = 'mpesa' AND reference = $1",
+    )
+    .bind(&callback.checkout_request_id)
+    .bind(payment_status)
+    .execute(&pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        tracing::warn!(
+            checkout_request_id = %callback.checkout_request_id,
+            payments_updated = payment_updates.rows_affected(),
+            "Daraja callback has no matching STK intent"
+        );
+    } else {
+        tracing::info!(
+            result_code = callback.result_code,
+            status = intent_status,
+            payments_updated = payment_updates.rows_affected(),
+            "daraja callback reconciled"
+        );
+    }
     Ok(Json(json!({ "ResultCode": 0, "ResultDesc": "accepted" })))
 }
 
@@ -525,5 +648,41 @@ mod tests {
         .unwrap();
         assert_eq!(first, same);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn daraja_callback_requires_checkout_id_and_result_code() {
+        let valid = json!({
+            "Body": {
+                "stkCallback": {
+                    "CheckoutRequestID": "ws_CO_123",
+                    "ResultCode": 0,
+                    "CallbackMetadata": {
+                        "Item": [{ "Name": "MpesaReceiptNumber", "Value": "QX7ABC1" }]
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            parse_daraja_callback(&valid).unwrap(),
+            DarajaCallback {
+                checkout_request_id: "ws_CO_123".into(),
+                result_code: 0,
+                receipt_number: Some("QX7ABC1".into()),
+            }
+        );
+        assert!(
+            parse_daraja_callback(&json!({"Body": {"stkCallback": {"ResultCode": 0}}})).is_err()
+        );
+        assert!(parse_daraja_callback(
+            &json!({"Body": {"stkCallback": {"CheckoutRequestID": "ws_CO_123"}}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn phone_mask_keeps_only_last_four_digits() {
+        assert_eq!(mask_phone("+254712345678"), "****5678");
+        assert_eq!(mask_phone("123"), "****");
     }
 }
