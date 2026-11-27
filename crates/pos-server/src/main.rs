@@ -89,6 +89,10 @@ fn build_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
             "/payments/mpesa/stkpush",
             post(routes::payments::mpesa_stkpush),
         )
+        .route(
+            "/payments/mpesa/status/{checkout_request_id}",
+            get(routes::payments::mpesa_status),
+        )
         .layer(middleware::from_fn_with_state(config, auth::require_auth));
 
     Router::new()

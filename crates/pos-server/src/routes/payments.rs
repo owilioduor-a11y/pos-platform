@@ -1,7 +1,7 @@
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use pos_domain::money::{Currency, Money};
@@ -474,6 +474,49 @@ pub async fn mpesa_stkpush(
     Ok(Json(response))
 }
 
+fn mpesa_status_response(
+    status: &str,
+    result_code: Option<i64>,
+    receipt_number: Option<&str>,
+    amount_minor: i64,
+) -> Value {
+    json!({
+        "status": status,
+        "approved": status == "completed",
+        "result_code": result_code,
+        "receipt_number": receipt_number,
+        "amount_minor": amount_minor,
+    })
+}
+
+/// GET /api/v1/payments/mpesa/status/:checkout_request_id — poll the
+/// reconciled callback result for an STK Push belonging to this merchant.
+pub async fn mpesa_status(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(checkout_request_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if checkout_request_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("checkout request id required".into()));
+    }
+    let row: Option<(String, Option<i64>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT status, result_code, receipt_number, amount_minor
+         FROM mpesa_stk_intents
+         WHERE merchant_id = $1 AND checkout_request_id = $2",
+    )
+    .bind(user.merchant_id)
+    .bind(&checkout_request_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let (status, result_code, receipt_number, amount_minor) = row.ok_or(ApiError::NotFound)?;
+    Ok(Json(mpesa_status_response(
+        &status,
+        result_code,
+        receipt_number.as_deref(),
+        amount_minor,
+    )))
+}
+
 /// POST /api/v1/webhooks/daraja — Safaricom STK callback.
 /// Public route: Safaricom callbacks are unsigned, so the result is accepted
 /// only when the CheckoutRequestID matches a stored STK intent. Replays are
@@ -684,5 +727,16 @@ mod tests {
     fn phone_mask_keeps_only_last_four_digits() {
         assert_eq!(mask_phone("+254712345678"), "****5678");
         assert_eq!(mask_phone("123"), "****");
+    }
+
+    #[test]
+    fn mpesa_status_marks_only_completed_as_approved() {
+        let pending = mpesa_status_response("pending", None, None, 1000);
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(pending["approved"], false);
+
+        let completed = mpesa_status_response("completed", Some(0), Some("QX7ABC1"), 1000);
+        assert_eq!(completed["approved"], true);
+        assert_eq!(completed["receipt_number"], "QX7ABC1");
     }
 }
