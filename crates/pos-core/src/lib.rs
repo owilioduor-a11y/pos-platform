@@ -9,9 +9,10 @@ use pos_domain::money::{Currency, Money};
 use pos_domain::payment::{CardScheme, EmvCardMetadata, FundingType};
 use pos_domain::sale::{finalize_sale, Cart, SplitPayment};
 use pos_domain::tax::{TaxEngine, TaxMode};
-use pos_domain::{DomainError, PaymentMethod};
+use pos_domain::{DomainError, DomainResult, PaymentMethod};
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use uuid::Uuid;
 
@@ -115,6 +116,21 @@ fn parse_funding(raw: &str) -> FundingType {
         "prepaid" => FundingType::Prepaid,
         _ => FundingType::Debit,
     }
+}
+
+/// Collapse cart lines into one stock deduction per tracked product.
+fn stock_requests(cart: &Cart) -> DomainResult<Vec<(Uuid, u32)>> {
+    let mut totals: HashMap<Uuid, u32> = HashMap::new();
+    for item in &cart.items {
+        if item.product.stock_qty.is_none() {
+            continue;
+        }
+        let total = totals.entry(item.product.id).or_insert(0);
+        *total = total
+            .checked_add(item.quantity)
+            .ok_or(DomainError::InvalidQuantity)?;
+    }
+    Ok(totals.into_iter().collect())
 }
 
 /// Offline-first POS engine exposed to Android via UniFFI.
@@ -331,32 +347,34 @@ impl PosCore {
         let payload = serde_json::to_string(&sale)
             .map_err(|e| PosCoreError::Database(format!("serialize sale: {e}")))?;
 
-        let inserted = self
+        let requests = stock_requests(&cart).map_err(domain_err)?;
+        let outcome = self
             .runtime
-            .block_on(async {
-                let inserted = repository::insert_sale(&self.pool, &sale, &payload).await?;
-                if inserted {
-                    repository::enqueue_outbox(&self.pool, "sale", &payload).await?;
-                }
-                Ok::<bool, anyhow::Error>(inserted)
-            })
+            .block_on(repository::commit_checkout(
+                &self.pool, &sale, &payload, &requests,
+            ))
             .map_err(db_err)?;
 
-        *lock_cart(&self.cart) = Cart::new();
-        if inserted {
-            return Ok(sale.id.to_string());
+        match outcome {
+            repository::CheckoutCommit::Inserted => {
+                *lock_cart(&self.cart) = Cart::new();
+                Ok(sale.id.to_string())
+            }
+            repository::CheckoutCommit::Duplicate(existing_id) => {
+                // Retry with the same key: keep the original sale and do not
+                // deduct stock or enqueue a second outbox row.
+                *lock_cart(&self.cart) = Cart::new();
+                Ok(existing_id.to_string())
+            }
+            repository::CheckoutCommit::StockShortage(shortage) => {
+                // Keep the cart so the cashier can adjust the quantity.
+                Err(domain_err(DomainError::InsufficientStock {
+                    sku: shortage.sku,
+                    requested: shortage.requested,
+                    available: shortage.available,
+                }))
+            }
         }
-
-        // Retry with the same key: return the original sale and do not
-        // enqueue a second outbox row.
-        self.runtime
-            .block_on(repository::sale_id_for_idempotency_key(
-                &self.pool,
-                idempotency_key,
-            ))
-            .map_err(db_err)?
-            .map(|id| id.to_string())
-            .ok_or_else(|| PosCoreError::Database("idempotent sale is missing".into()))
     }
 
     /// Record an approved NFC tap result for audit/sync. NEVER pass PAN,
@@ -512,5 +530,71 @@ mod tests {
             )
             .is_err());
         assert_eq!(count_rows(&core, "sync_outbox"), 0);
+    }
+
+    fn stock_for(core: &PosCore, product_id: &str) -> Option<i64> {
+        core.runtime
+            .block_on(
+                sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT stock_qty FROM products_cache WHERE id = ?",
+                )
+                .bind(product_id)
+                .fetch_one(&core.pool),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn checkout_deducts_tracked_stock_once_per_idempotency_key() {
+        let core = test_core();
+        let id = core
+            .register_product(
+                "WIDGET".into(),
+                "Widget".into(),
+                1000,
+                "KES".into(),
+                None,
+                Some(5),
+                None,
+            )
+            .unwrap();
+        let legs = r#"[{"method":"cash","amount_minor":3000,"reference":"cash_1"}]"#;
+        let key = core.new_idempotency_key();
+
+        core.add_product_to_cart(id.clone(), 3).unwrap();
+        core.checkout(legs.to_string(), key.clone()).unwrap();
+        assert_eq!(stock_for(&core, &id), Some(2));
+
+        // Retry must not deduct stock a second time.
+        core.add_product_to_cart(id.clone(), 3).unwrap();
+        core.checkout(legs.to_string(), key).unwrap();
+        assert_eq!(stock_for(&core, &id), Some(2));
+    }
+
+    #[test]
+    fn checkout_rejects_overselling_and_keeps_cart() {
+        let core = test_core();
+        let id = core
+            .register_product(
+                "LIMITED".into(),
+                "Limited".into(),
+                1000,
+                "KES".into(),
+                None,
+                Some(2),
+                None,
+            )
+            .unwrap();
+        let legs = r#"[{"method":"cash","amount_minor":3000,"reference":"cash_1"}]"#;
+
+        core.add_product_to_cart(id.clone(), 3).unwrap();
+        let result = core.checkout(legs.to_string(), core.new_idempotency_key());
+        assert!(matches!(
+            result,
+            Err(PosCoreError::Domain(message)) if message.contains("insufficient stock")
+        ));
+        assert_eq!(stock_for(&core, &id), Some(2));
+        assert_eq!(count_rows(&core, "sync_outbox"), 0);
+        assert_eq!(core.cart_summary(), "items=1, adhoc=false");
     }
 }

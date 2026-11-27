@@ -114,13 +114,98 @@ fn product_from_row(row: SqliteRow) -> anyhow::Result<Product> {
     })
 }
 
-/// Persist a completed sale. Returns `true` if inserted, `false` if the
-/// idempotency key already existed (retry-safe dedupe).
-pub async fn insert_sale(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StockShortage {
+    pub sku: String,
+    pub requested: u32,
+    pub available: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckoutCommit {
+    Inserted,
+    Duplicate(Uuid),
+    StockShortage(StockShortage),
+}
+
+async fn sale_id_for_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    idempotency_key: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM sales WHERE idempotency_key = ? LIMIT 1")
+            .bind(idempotency_key.to_string())
+            .fetch_optional(&mut **tx)
+            .await?;
+    id.map(|raw| raw.parse::<Uuid>().context("invalid sale id"))
+        .transpose()
+}
+
+/// Atomically deduct stock, persist the sale and enqueue it for sync.
+/// A duplicate idempotency key short-circuits before any stock is deducted.
+pub async fn commit_checkout(
     pool: &SqlitePool,
     sale: &Sale,
     payload_json: &str,
-) -> anyhow::Result<bool> {
+    stock_requests: &[(Uuid, u32)],
+) -> anyhow::Result<CheckoutCommit> {
+    let mut tx: sqlx::Transaction<'_, sqlx::Sqlite> = pool.begin().await?;
+
+    if let Some(existing_id) = sale_id_for_key(&mut tx, sale.idempotency_key).await? {
+        return Ok(CheckoutCommit::Duplicate(existing_id));
+    }
+
+    for (product_id, requested) in stock_requests {
+        let row: Option<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT sku, stock_qty FROM products_cache
+             WHERE id = ? AND merchant_id = ? AND active = 1",
+        )
+        .bind(product_id.to_string())
+        .bind(sale.merchant_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((sku, stock)) = row else {
+            anyhow::bail!("product {product_id} is not in the active catalog");
+        };
+        let Some(stock) = stock else {
+            // NULL means stock is not tracked for this product.
+            continue;
+        };
+        let available = u32::try_from(stock).context("invalid stock_qty")?;
+        if available < *requested {
+            return Ok(CheckoutCommit::StockShortage(StockShortage {
+                sku,
+                requested: *requested,
+                available,
+            }));
+        }
+        let updated = sqlx::query(
+            "UPDATE products_cache SET stock_qty = stock_qty - ?
+             WHERE id = ? AND merchant_id = ? AND active = 1 AND stock_qty >= ?",
+        )
+        .bind(i64::from(*requested))
+        .bind(product_id.to_string())
+        .bind(sale.merchant_id.to_string())
+        .bind(i64::from(*requested))
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            let current: Option<i64> = sqlx::query_scalar(
+                "SELECT stock_qty FROM products_cache
+                 WHERE id = ? AND merchant_id = ? AND active = 1",
+            )
+            .bind(product_id.to_string())
+            .bind(sale.merchant_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            return Ok(CheckoutCommit::StockShortage(StockShortage {
+                sku,
+                requested: *requested,
+                available: current.and_then(|q| u32::try_from(q).ok()).unwrap_or(0),
+            }));
+        }
+    }
+
     let result = sqlx::query(
         "INSERT OR IGNORE INTO sales
             (id, merchant_id, idempotency_key, payload_json, status)
@@ -130,23 +215,22 @@ pub async fn insert_sale(
     .bind(sale.merchant_id.to_string())
     .bind(sale.idempotency_key.to_string())
     .bind(payload_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(result.rows_affected() > 0)
-}
+    if result.rows_affected() == 0 {
+        let existing_id = sale_id_for_key(&mut tx, sale.idempotency_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("duplicate sale idempotency key has no row"))?;
+        return Ok(CheckoutCommit::Duplicate(existing_id));
+    }
 
-/// Look up the sale originally created for an idempotency key.
-pub async fn sale_id_for_idempotency_key(
-    pool: &SqlitePool,
-    idempotency_key: Uuid,
-) -> anyhow::Result<Option<Uuid>> {
-    let id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM sales WHERE idempotency_key = ? LIMIT 1")
-            .bind(idempotency_key.to_string())
-            .fetch_optional(pool)
-            .await?;
-    id.map(|raw| raw.parse::<Uuid>().context("invalid sale id"))
-        .transpose()
+    sqlx::query("INSERT INTO sync_outbox (kind, payload_json) VALUES ('sale', ?)")
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(CheckoutCommit::Inserted)
 }
 
 /// Enqueue an arbitrary payload (sale JSON or tap event JSON) for sync.
