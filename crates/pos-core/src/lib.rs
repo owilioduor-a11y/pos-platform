@@ -118,13 +118,12 @@ fn parse_funding(raw: &str) -> FundingType {
     }
 }
 
-/// Collapse cart lines into one stock deduction per tracked product.
+/// Collapse cart lines into one stock deduction per product. The repository
+/// treats a NULL `stock_qty` as untracked, so the cart snapshot must not decide
+/// which lines are deducted.
 fn stock_requests(cart: &Cart) -> DomainResult<Vec<(Uuid, u32)>> {
     let mut totals: HashMap<Uuid, u32> = HashMap::new();
     for item in &cart.items {
-        if item.product.stock_qty.is_none() {
-            continue;
-        }
         let total = totals.entry(item.product.id).or_insert(0);
         *total = total
             .checked_add(item.quantity)
@@ -596,5 +595,37 @@ mod tests {
         assert_eq!(stock_for(&core, &id), Some(2));
         assert_eq!(count_rows(&core, "sync_outbox"), 0);
         assert_eq!(core.cart_summary(), "items=1, adhoc=false");
+    }
+
+    #[test]
+    fn checkout_uses_database_stock_even_if_cart_snapshot_was_untracked() {
+        let core = test_core();
+        let id = core
+            .register_product(
+                "LATER".into(),
+                "Later".into(),
+                1000,
+                "KES".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let legs = r#"[{"method":"cash","amount_minor":3000,"reference":"cash_1"}]"#;
+
+        // Cart copies the product while stock is untracked.
+        core.add_product_to_cart(id.clone(), 3).unwrap();
+        core.runtime
+            .block_on(
+                sqlx::query("UPDATE products_cache SET stock_qty = ? WHERE id = ?")
+                    .bind(5_i64)
+                    .bind(&id)
+                    .execute(&core.pool),
+            )
+            .unwrap();
+
+        core.checkout(legs.to_string(), core.new_idempotency_key())
+            .unwrap();
+        assert_eq!(stock_for(&core, &id), Some(2));
     }
 }

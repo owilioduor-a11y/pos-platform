@@ -94,8 +94,31 @@ impl From<serde_json::Error> for ApiError {
 
 impl From<pos_domain::DomainError> for ApiError {
     fn from(e: pos_domain::DomainError) -> Self {
-        Self::BadRequest(e.to_string())
+        match e {
+            pos_domain::DomainError::PaymentDeclined(reason) => Self::PaymentFailed(reason),
+            other => Self::BadRequest(other.to_string()),
+        }
     }
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_declines_map_to_payment_required() {
+        let error = ApiError::from(pos_domain::DomainError::PaymentDeclined("declined".into()));
+        assert_eq!(error.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(error.code(), "payment_failed");
+        assert!(!error.to_string().contains("payment failed: payment failed"));
+    }
+
+    #[test]
+    fn validation_errors_stay_bad_requests() {
+        let error = ApiError::from(pos_domain::DomainError::InvalidAmount("zero".into()));
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "bad_request");
+    }
+}
