@@ -2,14 +2,18 @@ package com.posplatform.app
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.posplatform.app.network.ApiClient
 import com.posplatform.app.softpos.MockTapToPayManager
 import com.posplatform.app.softpos.TapToPayManager
-import com.posplatform.app.ui.formatMinorUnits
+import java.net.URLEncoder
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import uniffi.pos_core.PosCore
 
 /** Merchant operating mode selected at onboarding. */
@@ -34,6 +38,8 @@ class PosViewModel : ViewModel() {
             apiToken = API_TOKEN,
         )
     }
+
+    private val apiClient: ApiClient by lazy { ApiClient(SERVER_URL, API_TOKEN) }
 
     private val tapManager: TapToPayManager = MockTapToPayManager()
 
@@ -125,19 +131,68 @@ class PosViewModel : ViewModel() {
         }
     }
 
-    /** Trigger an M-Pesa STK Push for the cart total via pos-server. */
+    /** Trigger an M-Pesa STK Push and complete checkout after the callback. */
     fun chargeByMpesa(phone: String) {
         val total = _cartTotalMinor.value
         if (total <= 0) {
             _lastMessage.value = "Cart is empty"
             return
         }
+        val customerPhone = phone.trim()
+        if (customerPhone.isEmpty()) {
+            _lastMessage.value = "Phone number required"
+            return
+        }
         viewModelScope.launch {
-            runCatching {
-                // STK Push is initiated server-side; checkout happens when
-                // the Daraja callback confirms payment (Phase 2 wiring).
-                _lastMessage.value = "STK Push sent to $phone for ${formatMinorUnits(total)} KES"
-            }.onFailure { _lastMessage.value = it.message }
+            try {
+                val request = JSONObject()
+                    .put("phone", customerPhone)
+                    .put("amount_minor", total)
+                    .put("currency_code", CURRENCY)
+                    .put("idempotency_key", engine.newIdempotencyKey())
+                val push = withContext(Dispatchers.IO) {
+                    apiClient.post("/api/v1/payments/mpesa/stkpush", request)
+                }
+                val checkoutId = push.optString("checkout_request_id").orEmpty()
+                if (!push.optBoolean("approved") || checkoutId.isEmpty()) {
+                    val reason = push.optString("response_description").orEmpty()
+                    _lastMessage.value = reason.ifEmpty { "STK Push was not accepted" }
+                    return@launch
+                }
+
+                _lastMessage.value = "STK Push sent; waiting for confirmation"
+                val encodedId = URLEncoder.encode(checkoutId, "UTF-8")
+                var settled = false
+                var attempts = 0
+                while (attempts < 15 && !settled) {
+                    val status = withContext(Dispatchers.IO) {
+                        apiClient.get("/api/v1/payments/mpesa/status/$encodedId")
+                    }
+                    when (status.optString("status")) {
+                        "completed" -> {
+                            settled = true
+                            checkout(listOf(
+                                mapOf(
+                                    "method" to "mpesa",
+                                    "amount_minor" to total,
+                                    "reference" to checkoutId,
+                                )
+                            ))
+                        }
+                        "failed" -> {
+                            settled = true
+                            _lastMessage.value = "M-Pesa payment failed"
+                        }
+                        else -> delay(2000)
+                    }
+                    attempts++
+                }
+                if (!settled) {
+                    _lastMessage.value = "M-Pesa payment still pending; check again later"
+                }
+            } catch (e: Exception) {
+                _lastMessage.value = e.message ?: "M-Pesa payment failed"
+            }
         }
     }
 
