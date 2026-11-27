@@ -76,7 +76,7 @@ fun RetailCatalogScreen(
             Column {
                 Text("Total", style = MaterialTheme.typography.labelMedium)
                 Text(
-                    "KSh ${"%.2f".format(totalMinor / 100.0)}",
+                    "KSh ${formatMinorUnits(totalMinor)}",
                     style = MaterialTheme.typography.headlineMedium,
                 )
             }
@@ -127,7 +127,7 @@ fun RetailCatalogScreen(
                         Text(product.name, style = MaterialTheme.typography.titleSmall)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "KSh ${"%.2f".format(product.priceMinor / 100.0)}",
+                            "KSh ${formatMinorUnits(product.priceMinor)}",
                             color = MaterialTheme.colorScheme.primary,
                         )
                     }
