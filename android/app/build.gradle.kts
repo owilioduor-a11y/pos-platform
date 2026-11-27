@@ -1,7 +1,77 @@
+import java.util.UUID
+import org.gradle.api.GradleException
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+/** Environment variables are preferred; -P properties are the local fallback. */
+fun posConfig(propertyName: String, envVar: String): String? =
+    listOf(System.getenv(envVar), project.findProperty(propertyName)?.toString())
+        .firstNotNullOfOrNull { raw -> raw?.trim()?.takeIf { it.isNotEmpty() } }
+
+/** Escape a value so it can be emitted as a Java/Kotlin string literal in BuildConfig. */
+fun buildConfigString(value: String): String = buildString {
+    append('"')
+    value.forEach { ch ->
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            else -> append(ch)
+        }
+    }
+    append('"')
+}
+
+fun requireReleaseConfig(serverUrl: String?, apiToken: String?, merchantId: String?) {
+    val missing = buildList {
+        if (serverUrl.isNullOrEmpty()) add("POS_SERVER_URL (-PposServerUrl)")
+        if (apiToken.isNullOrEmpty()) add("POS_API_TOKEN (-PposApiToken)")
+        if (merchantId.isNullOrEmpty()) add("POS_MERCHANT_ID (-PposMerchantId)")
+    }
+    if (missing.isNotEmpty()) {
+        throw GradleException("Release builds require: ${missing.joinToString(", ")}")
+    }
+    val url = requireNotNull(serverUrl)
+    val token = requireNotNull(apiToken)
+    val merchant = requireNotNull(merchantId)
+    if (!url.startsWith("https://", ignoreCase = true)) {
+        throw GradleException("Release POS_SERVER_URL must use https://")
+    }
+    if (token == "dev-token" || token.length < 32) {
+        throw GradleException("Release POS_API_TOKEN must be a real token (at least 32 characters)")
+    }
+    runCatching { UUID.fromString(merchant) }.onFailure {
+        throw GradleException("Release POS_MERCHANT_ID must be a valid UUID", it)
+    }
+}
+
+val posServerUrl = posConfig("posServerUrl", "POS_SERVER_URL")
+val posApiToken = posConfig("posApiToken", "POS_API_TOKEN")
+val posMerchantId = posConfig("posMerchantId", "POS_MERCHANT_ID")
+
+// Debug defaults stay on the emulator host; release values stay empty unless injected.
+val debugServerUrl = posServerUrl ?: "http://10.0.2.2:8080"
+val debugApiToken = posApiToken ?: "dev-token"
+val debugMerchantId = posMerchantId ?: "00000000-0000-7000-8000-000000000001"
+
+val validateReleaseConfig by tasks.registering {
+    description = "Fails a release build when production POS config is missing or unsafe."
+    group = "verification"
+    doLast {
+        requireReleaseConfig(posServerUrl, posApiToken, posMerchantId)
+    }
+}
+
+// Only release variants need production configuration; assembleDebug stays self-contained.
+tasks.configureEach {
+    if (name in setOf("processReleaseResources", "assembleRelease", "bundleRelease")) {
+        dependsOn(validateReleaseConfig)
+    }
 }
 
 android {
@@ -14,12 +84,20 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField("String", "SERVER_URL", buildConfigString(debugServerUrl))
+        buildConfigField("String", "API_TOKEN", buildConfigString(debugApiToken))
+        buildConfigField("String", "MERCHANT_ID", buildConfigString(debugMerchantId))
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Empty unless injected at build time; validateReleaseConfig blocks such builds.
+            buildConfigField("String", "SERVER_URL", buildConfigString(posServerUrl.orEmpty()))
+            buildConfigField("String", "API_TOKEN", buildConfigString(posApiToken.orEmpty()))
+            buildConfigField("String", "MERCHANT_ID", buildConfigString(posMerchantId.orEmpty()))
         }
         debug {
             isMinifyEnabled = false
@@ -37,6 +115,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {

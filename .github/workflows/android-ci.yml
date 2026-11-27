@@ -83,6 +83,17 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
+      - name: Verify release config fails closed
+        working-directory: android
+        run: |
+          if POS_SERVER_URL= POS_API_TOKEN= POS_MERCHANT_ID= \
+              gradle validateReleaseConfig --no-daemon > "$RUNNER_TEMP/release-config.log" 2>&1; then
+            echo "Release config validation passed without configuration" >&2
+            cat "$RUNNER_TEMP/release-config.log"
+            exit 1
+          fi
+          grep -q "Release builds require" "$RUNNER_TEMP/release-config.log"
+
       - name: Build debug APK
         working-directory: android
         run: gradle assembleDebug --no-daemon

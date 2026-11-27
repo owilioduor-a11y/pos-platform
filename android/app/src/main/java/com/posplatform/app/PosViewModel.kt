@@ -6,6 +6,7 @@ import com.posplatform.app.network.ApiClient
 import com.posplatform.app.softpos.MockTapToPayManager
 import com.posplatform.app.softpos.TapToPayManager
 import java.net.URLEncoder
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,8 +29,7 @@ enum class TapState { IDLE, WAITING, APPROVED, DECLINED }
 class PosViewModel : ViewModel() {
 
     private val engine: PosCore by lazy {
-        // Production: load libpos_core.so and pass real server URL + JWT.
-        // For development we point at the local emulator host.
+        // Server URL, token and merchant ID are injected at build time (see build.gradle.kts).
         System.loadLibrary("pos_core")
         PosCore(
             dbPath = "pos_platform.db",
@@ -241,8 +241,44 @@ class PosViewModel : ViewModel() {
 
     companion object {
         private const val CURRENCY = "KES"
-        private const val SERVER_URL = "http://10.0.2.2:8080"
-        private const val API_TOKEN = "dev-token"
-        private const val MERCHANT_ID = "00000000-0000-7000-8000-000000000001"
+
+        private val SERVER_URL: String by lazy {
+            val value = BuildConfig.SERVER_URL
+            require(value.isNotBlank()) {
+                "SERVER_URL is not configured; rebuild with POS_SERVER_URL or -PposServerUrl"
+            }
+            if (!BuildConfig.DEBUG) {
+                require(value.startsWith("https://", ignoreCase = true)) {
+                    "Release builds require an HTTPS SERVER_URL"
+                }
+            }
+            value
+        }
+
+        private val API_TOKEN: String by lazy {
+            val value = BuildConfig.API_TOKEN
+            require(value.isNotBlank()) {
+                "API_TOKEN is not configured; rebuild with POS_API_TOKEN or -PposApiToken"
+            }
+            if (!BuildConfig.DEBUG) {
+                require(value != "dev-token" && value.length >= 32) {
+                    "Release builds require a real API token"
+                }
+            }
+            value
+        }
+
+        private val MERCHANT_ID: String by lazy {
+            val value = BuildConfig.MERCHANT_ID
+            require(value.isNotBlank()) {
+                "MERCHANT_ID is not configured; rebuild with POS_MERCHANT_ID or -PposMerchantId"
+            }
+            if (!BuildConfig.DEBUG) {
+                require(runCatching { UUID.fromString(value) }.isSuccess) {
+                    "Release builds require a valid merchant UUID"
+                }
+            }
+            value
+        }
     }
 }

@@ -33,3 +33,26 @@ An offline-first Point-of-Sale system built in **Rust** and **Kotlin (Jetpack Co
    ```bash
    cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p pos-core --release
    ```
+
+## Android configuration
+
+The app no longer hardcodes its backend endpoint or credentials. Values are injected into `BuildConfig` at build time:
+
+| Value | Environment variable | Gradle property | Debug default |
+| --- | --- | --- | --- |
+| Server URL | `POS_SERVER_URL` | `-PposServerUrl` | `http://10.0.2.2:8080` |
+| API token (JWT) | `POS_API_TOKEN` | `-PposApiToken` | `dev-token` |
+| Merchant ID (UUID) | `POS_MERCHANT_ID` | `-PposMerchantId` | `00000000-0000-7000-8000-000000000001` |
+
+Environment variables take precedence over `-P` properties. Debug builds work out of the box against the Android emulator host; override any value to target a different backend.
+
+Release builds **fail closed**: `validateReleaseConfig` runs before resource processing and rejects missing values, plaintext `http://` URLs, the `dev-token` placeholder, short tokens, and non-UUID merchant IDs. The app repeats those checks at startup, so a misconfigured release APK cannot silently talk to a development backend.
+
+```bash
+POS_SERVER_URL=https://pos.example.com \
+POS_API_TOKEN='eyJ...' \
+POS_MERCHANT_ID='00000000-0000-7000-8000-000000000001' \
+  gradle assembleRelease
+```
+
+Never commit real tokens to `android/gradle.properties` (it is tracked); prefer environment variables.
