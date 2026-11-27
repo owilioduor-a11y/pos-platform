@@ -15,11 +15,19 @@ pub struct Currency {
     pub symbol: String,
 }
 
+/// Largest exponent that fits in an `i64` minor-unit amount (10^18).
+pub const MAX_CURRENCY_EXPONENT: u32 = 18;
+
 impl Currency {
     pub fn new(code: &str, exponent: u32, symbol: &str) -> DomainResult<Self> {
         let code = code.trim().to_ascii_uppercase();
         if code.len() != 3 || !code.chars().all(|c| c.is_ascii_uppercase()) {
             return Err(DomainError::InvalidCurrency(code));
+        }
+        if exponent > MAX_CURRENCY_EXPONENT {
+            return Err(DomainError::InvalidCurrency(format!(
+                "{code} exponent {exponent} exceeds {MAX_CURRENCY_EXPONENT}"
+            )));
         }
         Ok(Self {
             code,
@@ -97,6 +105,10 @@ impl Money {
         self.amount_minor > 0
     }
 
+    pub fn is_negative(&self) -> bool {
+        self.amount_minor < 0
+    }
+
     /// Multiply by a whole-number quantity with overflow checking.
     pub fn mul_quantity(&self, qty: u32) -> DomainResult<Self> {
         let amount = self
@@ -138,14 +150,29 @@ impl Money {
         Self::new(amount, self.currency.clone())
     }
 
+    /// Subtract `other`, clamping at zero. Used for balances where an
+    /// overpayment is reported as fully paid rather than a negative amount.
+    pub fn clamped_sub_at_zero(&self, other: &Money) -> DomainResult<Self> {
+        self.ensure_same_currency(other)?;
+        let amount = match self.amount_minor.checked_sub(other.amount_minor) {
+            Some(value) => value.max(0),
+            // Overflow can only happen with an invalid negative `other`;
+            // a balance must never be negative.
+            None => 0,
+        };
+        Self::new(amount, self.currency.clone())
+    }
+
     /// Format for receipts, e.g. "KSh 1,250.00". Minor units only —
     /// formatting never touches floats.
     pub fn format(&self) -> String {
-        let exp = self.currency.exponent as usize;
+        // Deserialization can construct a Currency without going through
+        // `Currency::new`, so clamp the exponent instead of trusting it.
+        let exp = self.currency.exponent.min(MAX_CURRENCY_EXPONENT);
+        let divisor = 10u64.pow(exp);
         let minor = self.amount_minor.unsigned_abs();
-        let divisor = 10i64.pow(exp as u32);
-        let major = minor / divisor as u64;
-        let frac = minor % divisor as u64;
+        let major = minor / divisor;
+        let frac = minor % divisor;
         let sign = if self.amount_minor < 0 { "-" } else { "" };
         let symbol = if self.currency.symbol.is_empty() {
             self.currency.code.as_str()
@@ -155,7 +182,10 @@ impl Money {
         if exp == 0 {
             format!("{sign}{symbol} {major}")
         } else {
-            format!("{sign}{symbol} {major}.{frac:0>width$}", width = exp)
+            format!(
+                "{sign}{symbol} {major}.{frac:0>width$}",
+                width = exp as usize
+            )
         }
     }
 }
@@ -210,5 +240,34 @@ mod tests {
     fn currency_validation() {
         assert!(Currency::new("KE", 2, "").is_err());
         assert!(Currency::new("kes", 2, "").is_ok());
+        assert!(Currency::new("KES", 19, "").is_err());
+        assert_eq!(Currency::new("KES", 18, "").unwrap().exponent, 18);
+    }
+
+    #[test]
+    fn clamped_sub_clamps_overpayment() {
+        let paid = Money::new(1500, Currency::kes()).unwrap();
+        let total = Money::new(1000, Currency::kes()).unwrap();
+        assert!(total.clamped_sub_at_zero(&paid).unwrap().is_zero());
+    }
+
+    #[test]
+    fn format_negative_amount() {
+        let m = Money::new(-125000, Currency::kes()).unwrap();
+        assert_eq!(m.format(), "-KSh 1250.00");
+    }
+
+    #[test]
+    fn format_handles_deserialized_exponent() {
+        let m = Money::new(
+            123,
+            Currency {
+                code: "XXX".into(),
+                exponent: u32::MAX,
+                symbol: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(m.format().starts_with("XXX "));
     }
 }

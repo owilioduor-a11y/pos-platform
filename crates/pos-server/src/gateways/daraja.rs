@@ -119,18 +119,18 @@ impl DarajaClient {
             .unwrap_or("")
             .to_string();
 
-        Ok(PaymentReceipt {
-            approved: accepted,
+        Ok(PaymentReceipt::new(
+            accepted,
             reference,
-            amount: req.amount.clone(),
-            metadata: None,
-            decline_reason: if accepted {
+            req.amount.clone(),
+            None,
+            if accepted {
                 None
             } else {
                 Some(payload.to_string())
             },
-            raw_provider_payload: payload,
-        })
+            payload,
+        ))
     }
 }
 

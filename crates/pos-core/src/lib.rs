@@ -86,6 +86,19 @@ fn parse_method(raw: &str) -> Result<PaymentMethod, PosCoreError> {
     }
 }
 
+fn parse_idempotency_key(raw: &str) -> Result<Uuid, PosCoreError> {
+    let key = raw
+        .trim()
+        .parse::<Uuid>()
+        .map_err(|_| PosCoreError::InvalidInput("idempotency_key must be a UUID".into()))?;
+    if key.get_version_num() != 7 {
+        return Err(PosCoreError::InvalidInput(
+            "idempotency_key must be UUIDv7".into(),
+        ));
+    }
+    Ok(key)
+}
+
 fn parse_scheme(raw: &str) -> CardScheme {
     match raw.to_ascii_lowercase().as_str() {
         "visa" => CardScheme::Visa,
@@ -147,6 +160,7 @@ impl PosCore {
 
     /// Register (upsert) a product into the offline catalog cache.
     /// Returns the product UUID as a string.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_product(
         &self,
         sku: String,
@@ -155,15 +169,28 @@ impl PosCore {
         currency_code: String,
         barcode: Option<String>,
         stock_qty: Option<u32>,
+        tax_rate: Option<String>,
     ) -> Result<String, PosCoreError> {
         let currency = currency_for(&currency_code)?;
         let price = Money::new(price_minor, currency).map_err(domain_err)?;
-        let mut product = Product::new(self.merchant_id, sku, name, price).map_err(domain_err)?;
+        let tax_rate = match tax_rate {
+            Some(raw) => raw
+                .trim()
+                .parse::<rust_decimal::Decimal>()
+                .map_err(|_| PosCoreError::InvalidInput(format!("invalid tax_rate: {raw}")))?,
+            None => rust_decimal::Decimal::new(16, 2), // Kenya standard VAT
+        };
+        if tax_rate < rust_decimal::Decimal::ZERO || tax_rate > rust_decimal::Decimal::ONE {
+            return Err(PosCoreError::InvalidInput(format!(
+                "tax_rate out of range: {tax_rate}"
+            )));
+        }
+        let mut product = Product::new_with_tax_rate(self.merchant_id, sku, name, price, tax_rate)
+            .map_err(domain_err)?;
         product.barcode = barcode
             .map(|b| pos_domain::catalog::Barcode::parse(&b).map(|x| x.0))
             .transpose()
             .map_err(domain_err)?;
-        product.tax_rate = rust_decimal::Decimal::new(16, 2); // Kenya VAT 16%
         product.stock_qty = stock_qty;
         let id = product.id.to_string();
         self.runtime
@@ -251,13 +278,25 @@ impl PosCore {
         )
     }
 
+    /// Generate a client-side UUIDv7 key for the next checkout attempt.
+    /// Reusing this key on a retry deduplicates the sale on the server.
+    pub fn new_idempotency_key(&self) -> String {
+        Uuid::now_v7().to_string()
+    }
+
     /// Finalize the cart into a Sale and persist it offline.
     /// `payments_json` is a JSON array of legs:
     /// `[{"method":"card_tap","amount_minor":12500,"reference":"..."}, ...]`
+    /// `idempotency_key` must come from `new_idempotency_key()`.
     /// Returns the sale UUID. The sale is enqueued for server sync.
-    pub fn checkout(&self, payments_json: String) -> Result<String, PosCoreError> {
+    pub fn checkout(
+        &self,
+        payments_json: String,
+        idempotency_key: String,
+    ) -> Result<String, PosCoreError> {
         let legs: Vec<PaymentLegIn> = serde_json::from_str(&payments_json)
             .map_err(|e| PosCoreError::InvalidInput(format!("payments_json: {e}")))?;
+        let idempotency_key = parse_idempotency_key(&idempotency_key)?;
 
         let engine = TaxEngine::kenya_vat(TaxMode::Inclusive);
         let cart = lock_cart(&self.cart).clone();
@@ -265,18 +304,26 @@ impl PosCore {
             return Err(PosCoreError::InvalidInput("cart is empty".into()));
         }
 
-        let mut sale = finalize_sale(&cart, self.merchant_id, None, &engine, unix_now())
-            .map_err(domain_err)?;
+        let mut sale = finalize_sale(
+            &cart,
+            self.merchant_id,
+            None,
+            idempotency_key,
+            &engine,
+            unix_now(),
+        )
+        .map_err(domain_err)?;
 
         let currency = sale.totals.gross.currency.clone();
         sale.payments = legs
             .into_iter()
             .map(|leg| {
-                Ok(SplitPayment {
-                    method: parse_method(&leg.method)?,
-                    amount: Money::new(leg.amount_minor, currency.clone()).map_err(domain_err)?,
-                    reference: leg.reference,
-                })
+                SplitPayment::new(
+                    parse_method(&leg.method)?,
+                    Money::new(leg.amount_minor, currency.clone()).map_err(domain_err)?,
+                    leg.reference,
+                )
+                .map_err(domain_err)
             })
             .collect::<Result<Vec<_>, PosCoreError>>()?;
         sale.validate_payments().map_err(domain_err)?;
@@ -284,16 +331,32 @@ impl PosCore {
         let payload = serde_json::to_string(&sale)
             .map_err(|e| PosCoreError::Database(format!("serialize sale: {e}")))?;
 
-        self.runtime
+        let inserted = self
+            .runtime
             .block_on(async {
-                repository::insert_sale(&self.pool, &sale).await?;
-                repository::enqueue_outbox(&self.pool, "sale", &payload).await?;
-                Ok::<(), anyhow::Error>(())
+                let inserted = repository::insert_sale(&self.pool, &sale, &payload).await?;
+                if inserted {
+                    repository::enqueue_outbox(&self.pool, "sale", &payload).await?;
+                }
+                Ok::<bool, anyhow::Error>(inserted)
             })
             .map_err(db_err)?;
 
         *lock_cart(&self.cart) = Cart::new();
-        Ok(sale.id.to_string())
+        if inserted {
+            return Ok(sale.id.to_string());
+        }
+
+        // Retry with the same key: return the original sale and do not
+        // enqueue a second outbox row.
+        self.runtime
+            .block_on(repository::sale_id_for_idempotency_key(
+                &self.pool,
+                idempotency_key,
+            ))
+            .map_err(db_err)?
+            .map(|id| id.to_string())
+            .ok_or_else(|| PosCoreError::Database("idempotent sale is missing".into()))
     }
 
     /// Record an approved NFC tap result for audit/sync. NEVER pass PAN,
@@ -311,14 +374,15 @@ impl PosCore {
         processor_ref: String,
     ) -> Result<i64, PosCoreError> {
         let currency = currency_for(&currency_code)?;
-        let metadata = EmvCardMetadata {
-            scheme: parse_scheme(&scheme),
-            funding: parse_funding(&funding),
+        let metadata = EmvCardMetadata::new(
+            parse_scheme(&scheme),
+            parse_funding(&funding),
             pan_last4,
-            aid_masked: None,
+            None,
             auth_code,
-            app_label: None,
-        };
+            None,
+        )
+        .map_err(domain_err)?;
         let payload = serde_json::json!({
             "amount_minor": amount_minor,
             "currency": currency.code,
@@ -337,14 +401,116 @@ impl PosCore {
 
     /// Drain the sync outbox to pos-server. Returns rows synced.
     pub fn sync_pending(&self) -> Result<u32, PosCoreError> {
-        let synced = self
-            .runtime
+        self.runtime
             .block_on(sync::push_pending(
                 &self.pool,
                 &self.server_url,
                 &self.api_token,
             ))
-            .map_err(|e| PosCoreError::Sync(e.to_string()))?;
-        Ok(synced as u32)
+            .map_err(|e| PosCoreError::Sync(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    fn test_core() -> Arc<PosCore> {
+        PosCore::new(
+            ":memory:".into(),
+            Uuid::now_v7().to_string(),
+            "http://127.0.0.1:1".into(),
+            "test-token".into(),
+        )
+        .unwrap()
+    }
+
+    fn count_rows(core: &PosCore, table: &str) -> i64 {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        core.runtime
+            .block_on(sqlx::query_scalar::<_, i64>(&query).fetch_one(&core.pool))
+            .unwrap()
+    }
+
+    #[test]
+    fn checkout_retry_returns_original_sale_without_duplicate_outbox() {
+        let core = test_core();
+        let key = core.new_idempotency_key();
+        let legs = r#"[{"method":"cash","amount_minor":1000,"reference":"cash_1"}]"#;
+
+        core.set_adhoc_amount(1000, "KES".into()).unwrap();
+        let first = core.checkout(legs.to_string(), key.clone()).unwrap();
+        assert_eq!(count_rows(&core, "sync_outbox"), 1);
+
+        // A retry with the same key must not create a second sale or event.
+        core.set_adhoc_amount(1000, "KES".into()).unwrap();
+        let second = core.checkout(legs.to_string(), key).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(count_rows(&core, "sales"), 1);
+        assert_eq!(count_rows(&core, "sync_outbox"), 1);
+    }
+
+    #[test]
+    fn register_product_honours_zero_rated_tax_rate() {
+        let core = test_core();
+        let id = core
+            .register_product(
+                "BREAD".into(),
+                "Bread".into(),
+                10000,
+                "KES".into(),
+                Some("5901234123457".into()),
+                Some(5),
+                Some("0".into()),
+            )
+            .unwrap();
+
+        let product = core
+            .runtime
+            .block_on(repository::get_product(
+                &core.pool,
+                core.merchant_id,
+                id.parse::<Uuid>().unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(product.tax_rate, Decimal::ZERO);
+
+        core.add_product_to_cart(id, 1).unwrap();
+        assert_eq!(core.cart_total_minor().unwrap(), 10000);
+    }
+
+    #[test]
+    fn register_product_rejects_invalid_tax_rate() {
+        let core = test_core();
+        assert!(core
+            .register_product(
+                "BAD".into(),
+                "Bad".into(),
+                100,
+                "KES".into(),
+                None,
+                None,
+                Some("1.5".into()),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn record_tap_rejects_full_pan() {
+        let core = test_core();
+        assert!(core
+            .record_tap(
+                1000,
+                "KES".into(),
+                "visa".into(),
+                "credit".into(),
+                "4242424242424242".into(),
+                None,
+                "ref_1".into(),
+            )
+            .is_err());
+        assert_eq!(count_rows(&core, "sync_outbox"), 0);
     }
 }

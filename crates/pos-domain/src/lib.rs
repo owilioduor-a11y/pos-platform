@@ -37,6 +37,9 @@ pub enum DomainError {
     #[error("cart is empty")]
     EmptyCart,
 
+    #[error("no payments recorded")]
+    NoPayments,
+
     #[error("payment exceeds sale total by {0} minor units")]
     Overpayment(i64),
 
@@ -57,6 +60,9 @@ pub enum DomainError {
 
     #[error("invalid barcode: {0}")]
     InvalidBarcode(String),
+
+    #[error("invalid card metadata: {0}")]
+    InvalidCardMetadata(String),
 
     #[error("insufficient stock for sku {sku}: requested {requested}, available {available}")]
     InsufficientStock {

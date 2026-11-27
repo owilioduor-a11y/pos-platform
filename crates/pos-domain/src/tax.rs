@@ -26,8 +26,8 @@ pub struct TaxBreakdown {
 #[derive(Debug, Clone)]
 pub struct TaxEngine {
     /// Default rate as a fraction, e.g. Decimal::new(16, 2) = 0.16.
-    pub default_rate: Decimal,
-    pub mode: TaxMode,
+    default_rate: Decimal,
+    mode: TaxMode,
 }
 
 impl TaxEngine {
@@ -47,6 +47,15 @@ impl TaxEngine {
             default_rate: rate,
             mode,
         })
+    }
+
+    /// Default rate as a fraction (0.16 = 16%).
+    pub fn rate(&self) -> Decimal {
+        self.default_rate
+    }
+
+    pub fn mode(&self) -> TaxMode {
+        self.mode
     }
 
     /// Compute net/tax/gross for `amount`.

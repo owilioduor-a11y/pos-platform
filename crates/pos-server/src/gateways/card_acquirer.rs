@@ -68,28 +68,28 @@ impl CardAcquirerClient {
             .unwrap_or("")
             .to_string();
 
-        Ok(PaymentReceipt {
+        Ok(PaymentReceipt::new(
             approved,
             reference,
-            amount: req.amount.clone(),
-            metadata: None,
-            decline_reason: payload
+            req.amount.clone(),
+            None,
+            payload
                 .get("decline_reason")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            raw_provider_payload: payload,
-        })
+            payload,
+        ))
     }
 
     fn mock_receipt(req: &PaymentRequest) -> PaymentReceipt {
-        PaymentReceipt {
-            approved: true,
-            reference: format!("mock_{}", Uuid::now_v7().simple()),
-            amount: req.amount.clone(),
-            metadata: None,
-            decline_reason: None,
-            raw_provider_payload: json!({"mock": true}),
-        }
+        PaymentReceipt::new(
+            true,
+            format!("mock_{}", Uuid::now_v7().simple()),
+            req.amount.clone(),
+            None,
+            None,
+            json!({"mock": true}),
+        )
     }
 }
 
@@ -113,14 +113,14 @@ impl PaymentGateway for CardAcquirerClient {
 
     async fn refund(&self, reference: &str, amount: &Money) -> DomainResult<PaymentReceipt> {
         if self.mock {
-            return Ok(PaymentReceipt {
-                approved: true,
-                reference: format!("mock_refund_{reference}"),
-                amount: amount.clone(),
-                metadata: None,
-                decline_reason: None,
-                raw_provider_payload: json!({"mock": true}),
-            });
+            return Ok(PaymentReceipt::new(
+                true,
+                format!("mock_refund_{reference}"),
+                amount.clone(),
+                None,
+                None,
+                json!({"mock": true}),
+            ));
         }
         let body = json!({
             "reference": reference,
@@ -139,24 +139,24 @@ impl PaymentGateway for CardAcquirerClient {
             .json()
             .await
             .map_err(|e| DomainError::PaymentDeclined(format!("refund body: {e}")))?;
-        Ok(PaymentReceipt {
-            approved: payload
+        Ok(PaymentReceipt::new(
+            payload
                 .get("approved")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            reference: payload
+            payload
                 .get("reference")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            amount: amount.clone(),
-            metadata: None,
-            decline_reason: payload
+            amount.clone(),
+            None,
+            payload
                 .get("decline_reason")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            raw_provider_payload: payload,
-        })
+            payload,
+        ))
     }
 
     fn verify_webhook(&self, headers: &[(String, String)], body: &[u8]) -> DomainResult<bool> {

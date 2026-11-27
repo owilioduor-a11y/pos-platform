@@ -29,7 +29,7 @@ pub async fn push_pending(
     pool: &SqlitePool,
     server_url: &str,
     api_token: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<u32> {
     let client = Client::new();
     let base = server_url.trim_end_matches('/');
     let mut synced = 0usize;
@@ -37,10 +37,9 @@ pub async fn push_pending(
     loop {
         let rows = fetch_batch(pool).await?;
         if rows.is_empty() {
-            return Ok(synced);
+            return Ok(u32::try_from(synced).unwrap_or(u32::MAX));
         }
-        synced += rows.len();
-
+        let batch_len = rows.len();
         // Partition by destination endpoint.
         let (sales, events): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.kind == "sale");
 
@@ -64,6 +63,7 @@ pub async fn push_pending(
             )
             .await?;
         }
+        synced += batch_len;
     }
 }
 
@@ -94,12 +94,16 @@ async fn post_batch(
 ) -> anyhow::Result<()> {
     let items: Vec<OutboxItem> = rows
         .iter()
-        .map(|r| OutboxItem {
-            id: r.id,
-            kind: r.kind.clone(),
-            payload: serde_json::from_str(&r.payload_json).unwrap_or(serde_json::Value::Null),
+        .map(|r| {
+            let payload = serde_json::from_str(&r.payload_json)
+                .with_context(|| format!("outbox row {} has invalid JSON", r.id))?;
+            Ok(OutboxItem {
+                id: r.id,
+                kind: r.kind.clone(),
+                payload,
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let response = client
         .post(url)

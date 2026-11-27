@@ -1,6 +1,7 @@
 use anyhow::Context;
 use pos_domain::catalog::Product;
 use pos_domain::sale::Sale;
+use rust_decimal::Decimal;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -86,9 +87,14 @@ fn product_from_row(row: SqliteRow) -> anyhow::Result<Product> {
         pos_domain::money::Currency::new(&currency_code, 2, "").context("invalid currency")?;
     let price = pos_domain::money::Money::new(price_minor, currency).context("invalid price")?;
     let tax_rate: String = row.get("tax_rate");
-    let tax_rate = tax_rate
-        .parse::<rust_decimal::Decimal>()
-        .context("invalid tax rate")?;
+    let tax_rate = tax_rate.parse::<Decimal>().context("invalid tax rate")?;
+    if tax_rate < Decimal::ZERO || tax_rate > Decimal::ONE {
+        anyhow::bail!("tax rate out of range: {tax_rate}");
+    }
+    let stock_qty = row
+        .get::<Option<i64>, _>("stock_qty")
+        .map(|q| u32::try_from(q).context("invalid stock_qty"))
+        .transpose()?;
     Ok(Product {
         id: row
             .get::<String, _>("id")
@@ -103,15 +109,18 @@ fn product_from_row(row: SqliteRow) -> anyhow::Result<Product> {
         name: row.get("name"),
         price,
         tax_rate,
-        stock_qty: row.get::<Option<i64>, _>("stock_qty").map(|q| q as u32),
+        stock_qty,
         active: row.get::<i64, _>("active") != 0,
     })
 }
 
 /// Persist a completed sale. Returns `true` if inserted, `false` if the
 /// idempotency key already existed (retry-safe dedupe).
-pub async fn insert_sale(pool: &SqlitePool, sale: &Sale) -> anyhow::Result<bool> {
-    let payload = serde_json::to_string(sale).context("serialize sale")?;
+pub async fn insert_sale(
+    pool: &SqlitePool,
+    sale: &Sale,
+    payload_json: &str,
+) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "INSERT OR IGNORE INTO sales
             (id, merchant_id, idempotency_key, payload_json, status)
@@ -120,10 +129,24 @@ pub async fn insert_sale(pool: &SqlitePool, sale: &Sale) -> anyhow::Result<bool>
     .bind(sale.id.to_string())
     .bind(sale.merchant_id.to_string())
     .bind(sale.idempotency_key.to_string())
-    .bind(payload)
+    .bind(payload_json)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Look up the sale originally created for an idempotency key.
+pub async fn sale_id_for_idempotency_key(
+    pool: &SqlitePool,
+    idempotency_key: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM sales WHERE idempotency_key = ? LIMIT 1")
+            .bind(idempotency_key.to_string())
+            .fetch_optional(pool)
+            .await?;
+    id.map(|raw| raw.parse::<Uuid>().context("invalid sale id"))
+        .transpose()
 }
 
 /// Enqueue an arbitrary payload (sale JSON or tap event JSON) for sync.

@@ -135,7 +135,7 @@ class PosViewModel : ViewModel() {
             runCatching {
                 // STK Push is initiated server-side; checkout happens when
                 // the Daraja callback confirms payment (Phase 2 wiring).
-                _lastMessage.value = "STK Push sent to $phone for ${total / 100.0} KES"
+                _lastMessage.value = "STK Push sent to $phone for ${formatMinor(total)} KES"
             }.onFailure { _lastMessage.value = it.message }
         }
     }
@@ -161,7 +161,7 @@ class PosViewModel : ViewModel() {
             runCatching {
                 val json = org.json.JSONArray(legs.map { org.json.JSONObject(it) })
                     .toString()
-                engine.checkout(json)
+                engine.checkout(json, engine.newIdempotencyKey())
             }.onSuccess { saleId ->
                 _lastMessage.value = "Sale complete: ${saleId.take(8)}"
                 refreshCart()
@@ -181,6 +181,13 @@ class PosViewModel : ViewModel() {
     private fun refreshCart() {
         _cartSummary.value = engine.cartSummary()
         _cartTotalMinor.value = runCatching { engine.cartTotalMinor() }.getOrDefault(0L)
+    }
+
+    /** Display minor units without floating-point money math. */
+    private fun formatMinor(amountMinor: Long): String {
+        val sign = if (amountMinor < 0) "-" else ""
+        val abs = kotlin.math.abs(amountMinor)
+        return "$sign${abs / 100}.${(abs % 100).toString().padStart(2, '0')}"
     }
 
     companion object {

@@ -65,11 +65,24 @@ pub struct Product {
 }
 
 impl Product {
+    /// Create a product with Kenya's standard 16% VAT rate.
     pub fn new(
         merchant_id: Uuid,
         sku: impl Into<String>,
         name: impl Into<String>,
         price: Money,
+    ) -> DomainResult<Self> {
+        Self::new_with_tax_rate(merchant_id, sku, name, price, Decimal::new(16, 2))
+    }
+
+    /// Create a product with an explicit rate so zero-rated or exempt items
+    /// are taxed correctly (KENYA_LAUNCH.md §3).
+    pub fn new_with_tax_rate(
+        merchant_id: Uuid,
+        sku: impl Into<String>,
+        name: impl Into<String>,
+        price: Money,
+        tax_rate: Decimal,
     ) -> DomainResult<Self> {
         let sku = sku.into().trim().to_string();
         let name = name.into().trim().to_string();
@@ -79,8 +92,11 @@ impl Product {
         if name.is_empty() {
             return Err(DomainError::InvalidInput("name cannot be empty".into()));
         }
-        if !price.is_positive() && !price.is_zero() {
+        if price.is_negative() {
             return Err(DomainError::InvalidAmount("negative price".into()));
+        }
+        if tax_rate < Decimal::ZERO || tax_rate > Decimal::ONE {
+            return Err(DomainError::InvalidTaxRate(tax_rate.to_string()));
         }
         Ok(Self {
             id: Uuid::now_v7(),
@@ -89,7 +105,7 @@ impl Product {
             barcode: None,
             name,
             price,
-            tax_rate: Decimal::new(16, 2), // Kenya standard VAT 16%
+            tax_rate,
             stock_qty: None,
             active: true,
         })
@@ -131,6 +147,14 @@ mod tests {
         let mid = Uuid::now_v7();
         assert!(Product::new(mid, "", "Name", m.clone()).is_err());
         assert!(Product::new(mid, "SKU", "", m).is_err());
+    }
+
+    #[test]
+    fn tax_rate_is_validated() {
+        let m = Money::new(100, crate::money::Currency::kes()).unwrap();
+        let mid = Uuid::now_v7();
+        assert!(Product::new_with_tax_rate(mid, "ZERO", "Bread", m.clone(), Decimal::ZERO).is_ok());
+        assert!(Product::new_with_tax_rate(mid, "BAD", "Bad", m, Decimal::new(150, 2)).is_err());
     }
 
     #[test]
