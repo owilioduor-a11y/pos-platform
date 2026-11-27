@@ -31,9 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
-    if config.is_production() && config.jwt_secret.len() < 32 {
-        anyhow::bail!("JWT_SECRET must be at least 32 chars in production");
-    }
+    config.validate()?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)

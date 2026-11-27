@@ -58,6 +58,20 @@ pub async fn register(
             "password must be at least 8 characters".into(),
         ));
     }
+    if req.password.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "password must be at most 128 characters".into(),
+        ));
+    }
+    let email = req.email.trim().to_ascii_lowercase();
+    if email.is_empty()
+        || email.len() > 254
+        || email.matches('@').count() != 1
+        || email.starts_with('@')
+        || email.ends_with('@')
+    {
+        return Err(ApiError::BadRequest("valid email required".into()));
+    }
     let currency = req
         .currency_code
         .clone()
@@ -88,7 +102,7 @@ pub async fn register(
     )
     .bind(user_id)
     .bind(merchant_id)
-    .bind(req.email.trim().to_ascii_lowercase())
+    .bind(&email)
     .bind(&password_hash)
     .execute(&mut *tx)
     .await
@@ -114,12 +128,16 @@ pub async fn login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
+    if req.password.len() > 128 {
+        return Err(ApiError::Unauthorized);
+    }
     let pool = state.pool.clone();
     let config = &state.config;
+    let email = req.email.trim().to_ascii_lowercase();
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
         "SELECT id, merchant_id, password_hash, role FROM users WHERE email = $1",
     )
-    .bind(req.email.trim().to_ascii_lowercase())
+    .bind(&email)
     .fetch_optional(&pool)
     .await?
     .ok_or(ApiError::Unauthorized)?;

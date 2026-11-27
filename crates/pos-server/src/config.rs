@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 /// Typed environment configuration loaded once at startup.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub app_env: String,
     pub host: String,
@@ -29,6 +29,47 @@ pub struct Config {
     pub etims_api_url: String,
     pub etims_tin: String,
     pub etims_bhf_id: String,
+}
+
+fn redacted(value: &str) -> &'static str {
+    if value.is_empty() {
+        "<unset>"
+    } else {
+        "<redacted>"
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("app_env", &self.app_env)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database_url", &redacted(&self.database_url))
+            .field("jwt_secret", &redacted(&self.jwt_secret))
+            .field("jwt_expiry_seconds", &self.jwt_expiry_seconds)
+            .field("daraja_env", &self.daraja_env)
+            .field("daraja_consumer_key", &redacted(&self.daraja_consumer_key))
+            .field(
+                "daraja_consumer_secret",
+                &redacted(&self.daraja_consumer_secret),
+            )
+            .field("daraja_passkey", &redacted(&self.daraja_passkey))
+            .field("daraja_shortcode", &redacted(&self.daraja_shortcode))
+            .field("daraja_callback_url", &redacted(&self.daraja_callback_url))
+            .field("acquirer_provider", &self.acquirer_provider)
+            .field("acquirer_api_url", &redacted(&self.acquirer_api_url))
+            .field("acquirer_api_key", &redacted(&self.acquirer_api_key))
+            .field(
+                "acquirer_webhook_secret",
+                &redacted(&self.acquirer_webhook_secret),
+            )
+            .field("etims_enabled", &self.etims_enabled)
+            .field("etims_api_url", &redacted(&self.etims_api_url))
+            .field("etims_tin", &redacted(&self.etims_tin))
+            .field("etims_bhf_id", &redacted(&self.etims_bhf_id))
+            .finish()
+    }
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -71,7 +112,136 @@ impl Config {
         })
     }
 
+    /// Fail closed on settings that would otherwise process real payments
+    /// through mocks or issue unusable/misconfigured tokens.
+    pub fn validate(&self) -> Result<()> {
+        if self.port == 0 {
+            bail!("SERVER_PORT must be greater than zero");
+        }
+        if self.jwt_secret.is_empty() {
+            bail!("JWT_SECRET must not be empty");
+        }
+        if self.jwt_expiry_seconds <= 0 {
+            bail!("JWT_EXPIRY_SECONDS must be positive");
+        }
+        if self.jwt_expiry_seconds > 30 * 24 * 3600 {
+            bail!("JWT_EXPIRY_SECONDS must not exceed 30 days");
+        }
+
+        if self.is_production() {
+            if self.jwt_secret.len() < 32 {
+                bail!("JWT_SECRET must be at least 32 chars in production");
+            }
+            if self.acquirer_provider.eq_ignore_ascii_case("mock")
+                || self.acquirer_api_url.is_empty()
+                || self.acquirer_api_key.is_empty()
+            {
+                bail!("production requires a configured card acquirer; mock mode is disabled");
+            }
+            if self.acquirer_webhook_secret.is_empty() {
+                bail!("production requires KENYA_ACQUIRER_WEBHOOK_SECRET");
+            }
+
+            let mpesa_configured = [
+                &self.daraja_consumer_key,
+                &self.daraja_consumer_secret,
+                &self.daraja_passkey,
+                &self.daraja_shortcode,
+            ]
+            .iter()
+            .any(|value| !value.is_empty());
+            if mpesa_configured {
+                if !self.daraja_env.eq_ignore_ascii_case("production") {
+                    bail!("DARAJA_ENV must be production when M-Pesa credentials are configured");
+                }
+                if !self.daraja_callback_url.starts_with("https://") {
+                    bail!("DARAJA_CALLBACK_URL must be an https URL in production");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_production(&self) -> bool {
         self.app_env.eq_ignore_ascii_case("production")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            app_env: "development".into(),
+            host: "127.0.0.1".into(),
+            port: 8080,
+            database_url: "postgres://user:db_password@localhost/pos".into(),
+            jwt_secret: "dev-secret".into(),
+            jwt_expiry_seconds: 86400,
+            daraja_env: "sandbox".into(),
+            daraja_consumer_key: "mpesa_key".into(),
+            daraja_consumer_secret: "mpesa_secret".into(),
+            daraja_passkey: "mpesa_passkey".into(),
+            daraja_shortcode: "174379".into(),
+            daraja_callback_url: "http://localhost/callback".into(),
+            acquirer_provider: "mock".into(),
+            acquirer_api_url: "".into(),
+            acquirer_api_key: "".into(),
+            acquirer_webhook_secret: "".into(),
+            etims_enabled: false,
+            etims_api_url: "".into(),
+            etims_tin: "".into(),
+            etims_bhf_id: "".into(),
+        }
+    }
+
+    fn production_config() -> Config {
+        let mut config = test_config();
+        config.app_env = "production".into();
+        config.jwt_secret = "x".repeat(32);
+        config.acquirer_provider = "partner".into();
+        config.acquirer_api_url = "https://acquirer.example".into();
+        config.acquirer_api_key = "acquirer_key".into();
+        config.acquirer_webhook_secret = "webhook_secret".into();
+        config.daraja_env = "production".into();
+        config.daraja_callback_url = "https://pos.example/callback".into();
+        config
+    }
+
+    #[test]
+    fn development_allows_mock_acquirer() {
+        assert!(test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn production_rejects_mock_acquirer() {
+        let mut config = production_config();
+        config.acquirer_provider = "mock".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn production_rejects_sandbox_mpesa() {
+        let mut config = production_config();
+        config.daraja_env = "sandbox".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn production_rejects_short_jwt_secret() {
+        let mut config = production_config();
+        config.jwt_secret = "short".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let rendered = format!("{:?}", test_config());
+        assert!(!rendered.contains("db_password"));
+        assert!(!rendered.contains("dev-secret"));
+        assert!(!rendered.contains("mpesa_secret"));
+        assert!(!rendered.contains("acquirer_key"));
+        assert!(rendered.contains("<redacted>"));
     }
 }
