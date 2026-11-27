@@ -229,7 +229,7 @@ class PosViewModel : ViewModel() {
     fun syncNow() {
         viewModelScope.launch {
             runCatching { engine.syncPending() }
-                .onSuccess { n -> if (n > 0) _lastMessage.value = "Synced $n records" }
+                .onSuccess { n -> if (n > 0u) _lastMessage.value = "Synced $n records" }
                 .onFailure { _lastMessage.value = "Sync failed: ${it.message}" }
         }
     }
