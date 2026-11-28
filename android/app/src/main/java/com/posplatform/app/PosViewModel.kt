@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import uniffi.pos_core.PosCore
@@ -44,8 +46,13 @@ class PosViewModel : ViewModel() {
     // SQLite/UniFFI calls are synchronous and blocking. Keep them off Main and
     // serialized so cart mutations and checkout cannot interleave.
     private val engineContext = Dispatchers.IO.limitedParallelism(1)
+    private val operationMutex = Mutex()
 
     private suspend fun <T> onEngine(block: () -> T): T = withContext(engineContext) { block() }
+
+    /** Serialize whole operations so a cart cannot change mid-payment. */
+    private suspend fun <T> withOperation(block: suspend () -> T): T =
+        operationMutex.withLock { block() }
 
     // Release builds must never approve a tap through the development simulator.
     private val tapManager: TapToPayManager = TapToPayFactory.create(BuildConfig.DEBUG)
@@ -76,34 +83,40 @@ class PosViewModel : ViewModel() {
     /** Quick Charge: set an ad-hoc amount (minor units) for Micro mode. */
     fun setAdhocAmount(amountMinor: Long) {
         viewModelScope.launch {
-            try {
-                onEngine { engine.setAdhocAmount(amountMinor, CURRENCY) }
-                refreshCart()
-            } catch (e: Exception) {
-                _lastMessage.value = e.message
+            withOperation {
+                try {
+                    onEngine { engine.setAdhocAmount(amountMinor, CURRENCY) }
+                    refreshCartLocked()
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message
+                }
             }
         }
     }
 
     fun scanBarcode(barcode: String) {
         viewModelScope.launch {
-            try {
-                val found = onEngine { engine.scanBarcode(barcode) }
-                if (!found) _lastMessage.value = "Unknown barcode: $barcode"
-                refreshCart()
-            } catch (e: Exception) {
-                _lastMessage.value = e.message
+            withOperation {
+                try {
+                    val found = onEngine { engine.scanBarcode(barcode) }
+                    if (!found) _lastMessage.value = "Unknown barcode: $barcode"
+                    refreshCartLocked()
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message
+                }
             }
         }
     }
 
     fun clearCart() {
         viewModelScope.launch {
-            try {
-                onEngine { engine.clearCart() }
-                refreshCart()
-            } catch (e: Exception) {
-                _lastMessage.value = e.message
+            withOperation {
+                try {
+                    onEngine { engine.clearCart() }
+                    refreshCartLocked()
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message
+                }
             }
         }
     }
@@ -113,136 +126,151 @@ class PosViewModel : ViewModel() {
      * performs the EMV transaction; we only handle the masked result.
      */
     fun chargeByTap() {
-        val total = _cartTotalMinor.value
-        if (total <= 0) {
-            _lastMessage.value = "Cart is empty"
-            return
-        }
         viewModelScope.launch {
-            _tapState.value = TapState.WAITING
-            val result = tapManager.charge(amountMinor = total, currency = CURRENCY)
-            _tapState.value = if (result.approved) TapState.APPROVED else TapState.DECLINED
-
-            if (result.approved) {
-                // Record masked EMV metadata — never PAN/CVV.
-                onEngine {
-                    engine.recordTap(
-                        amountMinor = total,
-                        currencyCode = CURRENCY,
-                        scheme = result.scheme,
-                        funding = result.funding,
-                        panLast4 = result.panLast4,
-                        authCode = result.authCode,
-                        processorRef = result.processorRef,
-                    )
+            withOperation {
+                // Read the authoritative amount while the operation lock is held.
+                val total = onEngine { engine.cartTotalMinor() }
+                if (total <= 0) {
+                    _lastMessage.value = "Cart is empty"
+                    return@withOperation
                 }
-                checkout(listOf(
-                    mapOf(
-                        "method" to "card_tap",
-                        "amount_minor" to total,
-                        "reference" to result.processorRef,
-                    )
-                ))
-            } else {
-                _lastMessage.value = result.declineReason ?: "Card declined"
+
+                _tapState.value = TapState.WAITING
+                try {
+                    val result = tapManager.charge(amountMinor = total, currency = CURRENCY)
+                    _tapState.value = if (result.approved) TapState.APPROVED else TapState.DECLINED
+
+                    if (result.approved) {
+                        // Record masked EMV metadata — never PAN/CVV.
+                        onEngine {
+                            engine.recordTap(
+                                amountMinor = total,
+                                currencyCode = CURRENCY,
+                                scheme = result.scheme,
+                                funding = result.funding,
+                                panLast4 = result.panLast4,
+                                authCode = result.authCode,
+                                processorRef = result.processorRef,
+                            )
+                        }
+                        checkout(listOf(
+                            mapOf(
+                                "method" to "card_tap",
+                                "amount_minor" to total,
+                                "reference" to result.processorRef,
+                            )
+                        ))
+                    } else {
+                        _lastMessage.value = result.declineReason ?: "Card declined"
+                    }
+                } catch (e: Exception) {
+                    _tapState.value = TapState.DECLINED
+                    _lastMessage.value = e.message ?: "Tap payment failed"
+                }
+                delay(1500)
+                _tapState.value = TapState.IDLE
             }
-            delay(1500)
-            _tapState.value = TapState.IDLE
         }
     }
 
     /** Trigger an M-Pesa STK Push and complete checkout after the callback. */
     fun chargeByMpesa(phone: String) {
-        val total = _cartTotalMinor.value
-        if (total <= 0) {
-            _lastMessage.value = "Cart is empty"
-            return
-        }
         val customerPhone = phone.trim()
         if (customerPhone.isEmpty()) {
             _lastMessage.value = "Phone number required"
             return
         }
         viewModelScope.launch {
-            try {
-                val idempotencyKey = onEngine { engine.newIdempotencyKey() }
-                val request = JSONObject()
-                    .put("phone", customerPhone)
-                    .put("amount_minor", total)
-                    .put("currency_code", CURRENCY)
-                    .put("idempotency_key", idempotencyKey)
-                val push = withContext(Dispatchers.IO) {
-                    apiClient.post("/api/v1/payments/mpesa/stkpush", request)
+            withOperation {
+                // Hold the lock through STK confirmation so the cart cannot change
+                // between the approved amount and the offline sale record.
+                val total = onEngine { engine.cartTotalMinor() }
+                if (total <= 0) {
+                    _lastMessage.value = "Cart is empty"
+                    return@withOperation
                 }
-                val checkoutId = push.optString("checkout_request_id").orEmpty()
-                if (!push.optBoolean("approved") || checkoutId.isEmpty()) {
-                    val reason = push.optString("response_description").orEmpty()
-                    _lastMessage.value = reason.ifEmpty { "STK Push was not accepted" }
-                    return@launch
-                }
+                try {
+                    val idempotencyKey = onEngine { engine.newIdempotencyKey() }
+                    val request = JSONObject()
+                        .put("phone", customerPhone)
+                        .put("amount_minor", total)
+                        .put("currency_code", CURRENCY)
+                        .put("idempotency_key", idempotencyKey)
+                    val push = withContext(Dispatchers.IO) {
+                        apiClient.post("/api/v1/payments/mpesa/stkpush", request)
+                    }
+                    val checkoutId = push.optString("checkout_request_id").orEmpty()
+                    if (!push.optBoolean("approved") || checkoutId.isEmpty()) {
+                        val reason = push.optString("response_description").orEmpty()
+                        _lastMessage.value = reason.ifEmpty { "STK Push was not accepted" }
+                        return@withOperation
+                    }
 
-                _lastMessage.value = "STK Push sent; waiting for confirmation"
-                val encodedId = URLEncoder.encode(checkoutId, "UTF-8")
-                var settled = false
-                var attempts = 0
-                while (attempts < 15 && !settled) {
-                    val status = withContext(Dispatchers.IO) {
-                        apiClient.get("/api/v1/payments/mpesa/status/$encodedId")
-                    }
-                    when (status.optString("status")) {
-                        "completed" -> {
-                            settled = true
-                            checkout(listOf(
-                                mapOf(
-                                    "method" to "mpesa",
-                                    "amount_minor" to total,
-                                    "reference" to checkoutId,
-                                )
-                            ))
+                    _lastMessage.value = "STK Push sent; waiting for confirmation"
+                    val encodedId = URLEncoder.encode(checkoutId, "UTF-8")
+                    var settled = false
+                    var attempts = 0
+                    while (attempts < 15 && !settled) {
+                        val status = withContext(Dispatchers.IO) {
+                            apiClient.get("/api/v1/payments/mpesa/status/$encodedId")
                         }
-                        "failed" -> {
-                            settled = true
-                            _lastMessage.value = "M-Pesa payment failed"
+                        when (status.optString("status")) {
+                            "completed" -> {
+                                settled = true
+                                checkout(listOf(
+                                    mapOf(
+                                        "method" to "mpesa",
+                                        "amount_minor" to total,
+                                        "reference" to checkoutId,
+                                    )
+                                ))
+                            }
+                            "failed" -> {
+                                settled = true
+                                _lastMessage.value = "M-Pesa payment failed"
+                            }
+                            else -> delay(2000)
                         }
-                        else -> delay(2000)
+                        attempts++
                     }
-                    attempts++
+                    if (!settled) {
+                        _lastMessage.value = "M-Pesa payment still pending; check again later"
+                    }
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message ?: "M-Pesa payment failed"
                 }
-                if (!settled) {
-                    _lastMessage.value = "M-Pesa payment still pending; check again later"
-                }
-            } catch (e: Exception) {
-                _lastMessage.value = e.message ?: "M-Pesa payment failed"
             }
         }
     }
 
     /** Cash payment — completes the sale immediately. */
     fun chargeCash() {
-        val total = _cartTotalMinor.value
-        if (total <= 0) {
-            _lastMessage.value = "Cart is empty"
-            return
-        }
         viewModelScope.launch {
-            checkout(listOf(
-                mapOf(
-                    "method" to "cash",
-                    "amount_minor" to total,
-                    "reference" to "cash_${System.currentTimeMillis()}",
-                )
-            ))
+            withOperation {
+                val total = onEngine { engine.cartTotalMinor() }
+                if (total <= 0) {
+                    _lastMessage.value = "Cart is empty"
+                    return@withOperation
+                }
+                checkout(listOf(
+                    mapOf(
+                        "method" to "cash",
+                        "amount_minor" to total,
+                        "reference" to "cash_${System.currentTimeMillis()}",
+                    )
+                ))
+            }
         }
     }
 
+    /** Caller must hold [operationMutex]; internal helpers never re-lock. */
     private suspend fun checkout(legs: List<Map<String, Any>>) {
         try {
             val json = org.json.JSONArray(legs.map { org.json.JSONObject(it) })
                 .toString()
-            val idempotencyKey = onEngine { engine.newIdempotencyKey() }
-            val saleId = onEngine { engine.checkout(json, idempotencyKey) }
+            val saleId = onEngine { engine.checkout(json, engine.newIdempotencyKey()) }
             _lastMessage.value = "Sale complete: ${saleId.take(8)}"
-            refreshCart()
+            refreshCartLocked()
             syncNowInternal()
         } catch (e: Exception) {
             _lastMessage.value = e.message
@@ -250,7 +278,7 @@ class PosViewModel : ViewModel() {
     }
 
     fun syncNow() {
-        viewModelScope.launch { syncNowInternal() }
+        viewModelScope.launch { withOperation { syncNowInternal() } }
     }
 
     private suspend fun syncNowInternal() {
@@ -263,9 +291,14 @@ class PosViewModel : ViewModel() {
     }
 
     private suspend fun refreshCart() {
+        withOperation { refreshCartLocked() }
+    }
+
+    private suspend fun refreshCartLocked() {
         try {
-            val summary = onEngine { engine.cartSummary() }
-            val total = onEngine { engine.cartTotalMinor() }
+            val (summary, total) = onEngine {
+                engine.cartSummary() to engine.cartTotalMinor()
+            }
             _cartSummary.value = summary
             _cartTotalMinor.value = total
         } catch (e: Exception) {
