@@ -1,6 +1,8 @@
 package com.posplatform.app
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.posplatform.app.network.ApiClient
 import com.posplatform.app.softpos.TapToPayFactory
@@ -28,7 +30,11 @@ enum class TapState { IDLE, WAITING, APPROVED, DECLINED }
  * State bridge between the Compose UI and the Rust `pos-core` engine.
  * All monetary values are integer minor units (cents).
  */
-class PosViewModel : ViewModel() {
+class PosViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val pendingAttempts by lazy {
+        application.getSharedPreferences(PENDING_ATTEMPTS, Context.MODE_PRIVATE)
+    }
 
     private val engine: PosCore by lazy {
         // Server URL, token and merchant ID are injected at build time (see build.gradle.kts).
@@ -53,6 +59,45 @@ class PosViewModel : ViewModel() {
     /** Serialize whole operations so a cart cannot change mid-payment. */
     private suspend fun <T> withOperation(block: suspend () -> T): T =
         operationMutex.withLock { block() }
+
+    private suspend fun readPendingKey(): String? = withContext(Dispatchers.IO) {
+        pendingAttempts.getString(PENDING_KEY, null)?.takeIf { it.isNotBlank() }
+    }
+
+    private suspend fun persistPendingKey(key: String) {
+        withContext(Dispatchers.IO) {
+            check(pendingAttempts.edit().putString(PENDING_KEY, key).commit()) {
+                "Could not persist the pending payment attempt"
+            }
+        }
+    }
+
+    private suspend fun clearPendingKey() {
+        withContext(Dispatchers.IO) {
+            check(pendingAttempts.edit().remove(PENDING_KEY).commit()) {
+                "Could not clear the pending payment attempt; reconcile before another payment"
+            }
+        }
+    }
+
+    /** M-Pesa retries reuse the saved key so the server returns the first outcome. */
+    private suspend fun beginMpesaAttempt(): String {
+        readPendingKey()?.let { return it }
+        val key = onEngine { engine.newIdempotencyKey() }
+        persistPendingKey(key)
+        return key
+    }
+
+    /** A tap cannot be safely repeated; fail closed if a previous attempt exists. */
+    private suspend fun beginTapAttempt(): String? {
+        readPendingKey()?.let {
+            _lastMessage.value = "A payment is already pending; reconcile it before starting another"
+            return null
+        }
+        val key = onEngine { engine.newIdempotencyKey() }
+        persistPendingKey(key)
+        return key
+    }
 
     // Release builds must never approve a tap through the development simulator.
     private val tapManager: TapToPayManager = TapToPayFactory.create(BuildConfig.DEBUG)
@@ -121,6 +166,20 @@ class PosViewModel : ViewModel() {
         }
     }
 
+    /** Reconcile a stuck attempt out-of-band, then allow new payments. */
+    fun clearPendingAttempt() {
+        viewModelScope.launch {
+            withOperation {
+                try {
+                    clearPendingKey()
+                    _lastMessage.value = "Pending payment cleared; verify no charge is outstanding"
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message
+                }
+            }
+        }
+    }
+
     /**
      * Charge the full cart total via NFC tap. The certified SoftPOS SDK
      * performs the EMV transaction; we only handle the masked result.
@@ -134,6 +193,14 @@ class PosViewModel : ViewModel() {
                     _lastMessage.value = "Cart is empty"
                     return@withOperation
                 }
+
+                val idempotencyKey = try {
+                    beginTapAttempt()
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message ?: "Could not start the tap payment"
+                    return@withOperation
+                }
+                if (idempotencyKey == null) return@withOperation
 
                 _tapState.value = TapState.WAITING
                 try {
@@ -153,17 +220,26 @@ class PosViewModel : ViewModel() {
                                 processorRef = result.processorRef,
                             )
                         }
-                        checkout(listOf(
-                            mapOf(
-                                "method" to "card_tap",
-                                "amount_minor" to total,
-                                "reference" to result.processorRef,
-                            )
-                        ))
+                        checkout(
+                            legs = listOf(
+                                mapOf(
+                                    "method" to "card_tap",
+                                    "amount_minor" to total,
+                                    "reference" to result.processorRef,
+                                )
+                            ),
+                            idempotencyKey = idempotencyKey,
+                            clearPending = true,
+                        )
                     } else {
+                        // A clean decline means no charge occurred, so the key
+                        // can safely be reused for a later tap.
+                        clearPendingKey()
                         _lastMessage.value = result.declineReason ?: "Card declined"
                     }
                 } catch (e: Exception) {
+                    // Keep the pending key: the tap outcome may be unknown and
+                    // repeating it could create a second EMV charge.
                     _tapState.value = TapState.DECLINED
                     _lastMessage.value = e.message ?: "Tap payment failed"
                 }
@@ -190,7 +266,7 @@ class PosViewModel : ViewModel() {
                     return@withOperation
                 }
                 try {
-                    val idempotencyKey = onEngine { engine.newIdempotencyKey() }
+                    val idempotencyKey = beginMpesaAttempt()
                     val request = JSONObject()
                         .put("phone", customerPhone)
                         .put("amount_minor", total)
@@ -201,6 +277,8 @@ class PosViewModel : ViewModel() {
                     }
                     val checkoutId = push.optString("checkout_request_id").orEmpty()
                     if (!push.optBoolean("approved") || checkoutId.isEmpty()) {
+                        // No STK was sent, so this key can be reused safely.
+                        clearPendingKey()
                         val reason = push.optString("response_description").orEmpty()
                         _lastMessage.value = reason.ifEmpty { "STK Push was not accepted" }
                         return@withOperation
@@ -217,16 +295,23 @@ class PosViewModel : ViewModel() {
                         when (status.optString("status")) {
                             "completed" -> {
                                 settled = true
-                                checkout(listOf(
-                                    mapOf(
-                                        "method" to "mpesa",
-                                        "amount_minor" to total,
-                                        "reference" to checkoutId,
-                                    )
-                                ))
+                                checkout(
+                                    legs = listOf(
+                                        mapOf(
+                                            "method" to "mpesa",
+                                            "amount_minor" to total,
+                                            "reference" to checkoutId,
+                                        )
+                                    ),
+                                    idempotencyKey = idempotencyKey,
+                                    clearPending = true,
+                                )
                             }
                             "failed" -> {
                                 settled = true
+                                // A definitive failure means a new STK needs a
+                                // fresh key; the previous key is spent.
+                                clearPendingKey()
                                 _lastMessage.value = "M-Pesa payment failed"
                             }
                             else -> delay(2000)
@@ -247,30 +332,51 @@ class PosViewModel : ViewModel() {
     fun chargeCash() {
         viewModelScope.launch {
             withOperation {
-                val total = onEngine { engine.cartTotalMinor() }
-                if (total <= 0) {
-                    _lastMessage.value = "Cart is empty"
-                    return@withOperation
-                }
-                checkout(listOf(
-                    mapOf(
-                        "method" to "cash",
-                        "amount_minor" to total,
-                        "reference" to "cash_${System.currentTimeMillis()}",
+                try {
+                    if (readPendingKey() != null) {
+                        _lastMessage.value =
+                            "A payment is already pending; reconcile it before starting another"
+                        return@withOperation
+                    }
+                    val total = onEngine { engine.cartTotalMinor() }
+                    if (total <= 0) {
+                        _lastMessage.value = "Cart is empty"
+                        return@withOperation
+                    }
+                    val idempotencyKey = onEngine { engine.newIdempotencyKey() }
+                    checkout(
+                        legs = listOf(
+                            mapOf(
+                                "method" to "cash",
+                                "amount_minor" to total,
+                                "reference" to "cash_${System.currentTimeMillis()}",
+                            )
+                        ),
+                        idempotencyKey = idempotencyKey,
+                        clearPending = false,
                     )
-                ))
+                } catch (e: Exception) {
+                    _lastMessage.value = e.message
+                }
             }
         }
     }
 
     /** Caller must hold [operationMutex]; internal helpers never re-lock. */
-    private suspend fun checkout(legs: List<Map<String, Any>>) {
+    private suspend fun checkout(
+        legs: List<Map<String, Any>>,
+        idempotencyKey: String,
+        clearPending: Boolean = false,
+    ) {
         try {
             val json = org.json.JSONArray(legs.map { org.json.JSONObject(it) })
                 .toString()
-            val saleId = onEngine { engine.checkout(json, engine.newIdempotencyKey()) }
+            val saleId = onEngine { engine.checkout(json, idempotencyKey) }
             _lastMessage.value = "Sale complete: ${saleId.take(8)}"
             refreshCartLocked()
+            // Once the sale is durable offline, the outbox carries the same key.
+            // The pending key is only needed until that point.
+            if (clearPending) clearPendingKey()
             syncNowInternal()
         } catch (e: Exception) {
             _lastMessage.value = e.message
@@ -308,6 +414,8 @@ class PosViewModel : ViewModel() {
 
     companion object {
         private const val CURRENCY = "KES"
+        private const val PENDING_ATTEMPTS = "pos_pending_attempts"
+        private const val PENDING_KEY = "pending_idempotency_key"
 
         private val SERVER_URL: String by lazy {
             val value = BuildConfig.SERVER_URL

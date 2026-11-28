@@ -115,6 +115,7 @@ pub async fn sync_sales(
 #[derive(Debug, PartialEq, Eq)]
 struct StkIntentStatus {
     status: String,
+    idempotency_key: Uuid,
     amount_minor: i64,
     currency: String,
 }
@@ -123,6 +124,7 @@ struct StkIntentStatus {
 /// intent belongs to the authenticated merchant and matches the leg exactly.
 fn mpesa_payment_status(
     intent: Option<StkIntentStatus>,
+    sale_idempotency_key: Uuid,
     leg: &SplitPayment,
 ) -> ApiResult<&'static str> {
     let Some(intent) = intent else {
@@ -130,6 +132,11 @@ fn mpesa_payment_status(
             "M-Pesa reference has no STK intent for this merchant".into(),
         ));
     };
+    if intent.idempotency_key != sale_idempotency_key {
+        return Err(ApiError::BadRequest(
+            "M-Pesa intent belongs to a different payment attempt".into(),
+        ));
+    }
     if intent.amount_minor != leg.amount.amount_minor || intent.currency != leg.amount.currency.code
     {
         return Err(ApiError::BadRequest(
@@ -175,20 +182,23 @@ async fn insert_sale(
         // M-Pesa STK Push is confirmed asynchronously; carry the reconciled
         // intent status forward if a callback already arrived.
         let status = if payment.method == PaymentMethod::Mpesa {
-            let intent = sqlx::query_as::<_, (String, i64, String)>(
-                "SELECT status, amount_minor, currency FROM mpesa_stk_intents
+            let intent = sqlx::query_as::<_, (String, Uuid, i64, String)>(
+                "SELECT status, idempotency_key, amount_minor, currency FROM mpesa_stk_intents
                  WHERE checkout_request_id = $1 AND merchant_id = $2",
             )
             .bind(&payment.reference)
             .bind(merchant_id)
             .fetch_optional(&mut *tx)
             .await?
-            .map(|(status, amount_minor, currency)| StkIntentStatus {
-                status,
-                amount_minor,
-                currency,
-            });
-            mpesa_payment_status(intent, payment)?
+            .map(
+                |(status, idempotency_key, amount_minor, currency)| StkIntentStatus {
+                    status,
+                    idempotency_key,
+                    amount_minor,
+                    currency,
+                },
+            );
+            mpesa_payment_status(intent, sale.idempotency_key, payment)?
         } else {
             "approved"
         };
@@ -265,9 +275,15 @@ mod tests {
     use super::*;
     use pos_domain::money::{Currency, Money};
 
-    fn intent(status: &str, amount_minor: i64, currency: &str) -> StkIntentStatus {
+    fn intent(
+        status: &str,
+        idempotency_key: Uuid,
+        amount_minor: i64,
+        currency: &str,
+    ) -> StkIntentStatus {
         StkIntentStatus {
             status: status.into(),
+            idempotency_key,
             amount_minor,
             currency: currency.into(),
         }
@@ -285,16 +301,18 @@ mod tests {
     #[test]
     fn mpesa_leg_status_comes_from_matching_intent() {
         let leg = mpesa_leg(100_000, Currency::kes());
+        let key = Uuid::now_v7();
         assert_eq!(
-            mpesa_payment_status(Some(intent("completed", 100_000, "KES")), &leg).unwrap(),
+            mpesa_payment_status(Some(intent("completed", key, 100_000, "KES")), key, &leg)
+                .unwrap(),
             "approved"
         );
         assert_eq!(
-            mpesa_payment_status(Some(intent("failed", 100_000, "KES")), &leg).unwrap(),
+            mpesa_payment_status(Some(intent("failed", key, 100_000, "KES")), key, &leg).unwrap(),
             "failed"
         );
         assert_eq!(
-            mpesa_payment_status(Some(intent("pending", 100_000, "KES")), &leg).unwrap(),
+            mpesa_payment_status(Some(intent("pending", key, 100_000, "KES")), key, &leg).unwrap(),
             "pending"
         );
     }
@@ -315,8 +333,20 @@ mod tests {
     #[test]
     fn mpesa_leg_rejects_unknown_or_mismatched_intent() {
         let leg = mpesa_leg(100_000, Currency::kes());
-        assert!(mpesa_payment_status(None, &leg).is_err());
-        assert!(mpesa_payment_status(Some(intent("completed", 10_000, "KES")), &leg).is_err());
-        assert!(mpesa_payment_status(Some(intent("completed", 100_000, "USD")), &leg).is_err());
+        let key = Uuid::now_v7();
+        assert!(mpesa_payment_status(None, key, &leg).is_err());
+        assert!(
+            mpesa_payment_status(Some(intent("completed", key, 10_000, "KES")), key, &leg).is_err()
+        );
+        assert!(
+            mpesa_payment_status(Some(intent("completed", key, 100_000, "USD")), key, &leg)
+                .is_err()
+        );
+        assert!(mpesa_payment_status(
+            Some(intent("completed", Uuid::now_v7(), 100_000, "KES")),
+            key,
+            &leg
+        )
+        .is_err());
     }
 }
