@@ -61,19 +61,10 @@ pub async fn push_pending(
         if rows.is_empty() {
             return Ok(u32::try_from(synced).unwrap_or(u32::MAX));
         }
-        // Partition by destination endpoint.
+        // Partition by destination endpoint. Tap audit events must reach the
+        // server before their sale so card-leg correlation can succeed.
         let (sales, events): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.kind == "sale");
 
-        if !sales.is_empty() {
-            synced += post_batch(
-                pool,
-                &client,
-                &format!("{base}/api/v1/sync/sales"),
-                api_token,
-                sales,
-            )
-            .await?;
-        }
         if !events.is_empty() {
             synced += post_batch(
                 pool,
@@ -81,6 +72,16 @@ pub async fn push_pending(
                 &format!("{base}/api/v1/sync/events"),
                 api_token,
                 events,
+            )
+            .await?;
+        }
+        if !sales.is_empty() {
+            synced += post_batch(
+                pool,
+                &client,
+                &format!("{base}/api/v1/sync/sales"),
+                api_token,
+                sales,
             )
             .await?;
         }

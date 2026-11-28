@@ -158,6 +158,32 @@ fn mpesa_payment_status(
     }
 }
 
+/// A card leg only counts as approved when it matches a stored SoftPOS tap
+/// audit event. Without a certified acquirer webhook this is a correlation
+/// check, not cryptographic proof of EMV approval.
+fn card_tap_status(
+    event: Option<serde_json::Value>,
+    leg: &SplitPayment,
+) -> ApiResult<&'static str> {
+    let Some(event) = event else {
+        return Err(ApiError::BadRequest(
+            "card tap has no matching audit event".into(),
+        ));
+    };
+    let amount_minor = event.get("amount_minor").and_then(|v| v.as_i64());
+    let currency = event.get("currency").and_then(|v| v.as_str());
+    let reference = event.get("processor_ref").and_then(|v| v.as_str());
+    if amount_minor != Some(leg.amount.amount_minor)
+        || currency != Some(leg.amount.currency.code.as_str())
+        || reference != Some(leg.reference.as_str())
+    {
+        return Err(ApiError::BadRequest(
+            "tap audit event does not match the card payment leg".into(),
+        ));
+    }
+    Ok("approved")
+}
+
 /// Insert a sale + its payment legs atomically.
 /// Returns false on idempotency conflict, with no partial rows written.
 async fn insert_sale(
@@ -264,6 +290,25 @@ async fn insert_sale(
                 },
             );
             mpesa_payment_status(intent, sale.idempotency_key, payment)?
+        } else if payment.method == PaymentMethod::CardTap {
+            let event = sqlx::query_scalar::<_, serde_json::Value>(
+                "UPDATE sync_events
+                 SET consumed_by_sale_id = $1
+                 WHERE id = (
+                     SELECT id FROM sync_events
+                     WHERE merchant_id = $2 AND kind = 'tap'
+                       AND consumed_by_sale_id IS NULL
+                       AND payload_json->>'processor_ref' = $3
+                     ORDER BY id DESC LIMIT 1
+                 )
+                 RETURNING payload_json",
+            )
+            .bind(sale.id)
+            .bind(merchant_id)
+            .bind(&payment.reference)
+            .fetch_optional(&mut *tx)
+            .await?;
+            card_tap_status(event, payment)?
         } else {
             "approved"
         };
@@ -363,6 +408,15 @@ mod tests {
         .unwrap()
     }
 
+    fn card_leg(amount_minor: i64, currency: Currency) -> SplitPayment {
+        SplitPayment::new(
+            PaymentMethod::CardTap,
+            Money::new(amount_minor, currency).unwrap(),
+            "acquirer_ref_1",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn mpesa_leg_requires_a_settled_matching_intent() {
         let leg = mpesa_leg(100_000, Currency::kes());
@@ -378,6 +432,35 @@ mod tests {
         assert!(
             mpesa_payment_status(Some(intent("pending", key, 100_000, "KES")), key, &leg).is_err()
         );
+    }
+
+    #[test]
+    fn card_leg_requires_a_matching_tap_event() {
+        let leg = card_leg(12_500, Currency::kes());
+        let event = serde_json::json!({
+            "amount_minor": 12_500,
+            "currency": "KES",
+            "processor_ref": "acquirer_ref_1",
+        });
+        assert_eq!(
+            card_tap_status(Some(event.clone()), &leg).unwrap(),
+            "approved"
+        );
+        assert!(card_tap_status(None, &leg).is_err());
+
+        let wrong_amount = serde_json::json!({
+            "amount_minor": 12_400,
+            "currency": "KES",
+            "processor_ref": "acquirer_ref_1",
+        });
+        assert!(card_tap_status(Some(wrong_amount), &leg).is_err());
+
+        let wrong_ref = serde_json::json!({
+            "amount_minor": 12_500,
+            "currency": "KES",
+            "processor_ref": "other_ref",
+        });
+        assert!(card_tap_status(Some(wrong_ref), &leg).is_err());
     }
 
     #[test]
