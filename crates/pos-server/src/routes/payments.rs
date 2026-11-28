@@ -590,14 +590,16 @@ pub async fn daraja_webhook(
         .map_err(|_| ApiError::BadRequest("invalid JSON body".into()))?;
     let callback = parse_daraja_callback(&parsed)?;
 
-    let intent = sqlx::query_as::<_, (i64, String)>(
-        "SELECT amount_minor, phone_masked FROM mpesa_stk_intents
+    let intent = sqlx::query_as::<_, (Uuid, i64, String, String)>(
+        "SELECT merchant_id, amount_minor, currency, phone_masked FROM mpesa_stk_intents
          WHERE checkout_request_id = $1",
     )
     .bind(&callback.checkout_request_id)
     .fetch_optional(&pool)
     .await?;
-    let Some((intent_amount_minor, intent_phone_masked)) = intent else {
+    let Some((intent_merchant_id, intent_amount_minor, intent_currency, intent_phone_masked)) =
+        intent
+    else {
         tracing::warn!(
             checkout_request_id = %callback.checkout_request_id,
             "ignoring Daraja callback without a matching STK intent"
@@ -646,10 +648,18 @@ pub async fn daraja_webhook(
     // The sale may sync before or after the callback, so reconcile both sides.
     let payment_updates = sqlx::query(
         "UPDATE payments SET status = $2
-         WHERE method = 'mpesa' AND reference = $1",
+         WHERE method = 'mpesa' AND reference = $1
+           AND amount_minor = $4 AND currency = $5
+           AND EXISTS (
+               SELECT 1 FROM sales
+               WHERE sales.id = payments.sale_id AND sales.merchant_id = $3
+           )",
     )
     .bind(&callback.checkout_request_id)
     .bind(payment_status)
+    .bind(intent_merchant_id)
+    .bind(intent_amount_minor)
+    .bind(intent_currency)
     .execute(&pool)
     .await?;
     if updated.rows_affected() == 0 {

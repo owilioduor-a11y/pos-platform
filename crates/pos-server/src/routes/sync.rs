@@ -1,8 +1,8 @@
 use crate::auth::AuthUser;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use axum::extract::State;
 use axum::Json;
-use pos_domain::sale::Sale;
+use pos_domain::sale::{Sale, SplitPayment};
 use pos_domain::PaymentMethod;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -76,7 +76,7 @@ pub async fn sync_sales(
             continue;
         }
 
-        match insert_sale(&pool, &sale, user.user_id).await {
+        match insert_sale(&pool, &sale, user.merchant_id, user.user_id).await {
             Ok(true) => accepted += 1,
             Ok(false) => duplicates += 1,
             Err(e) => {
@@ -93,9 +93,45 @@ pub async fn sync_sales(
     }))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StkIntentStatus {
+    status: String,
+    amount_minor: i64,
+    currency: String,
+}
+
+/// A client-supplied checkout id only counts as evidence of payment when the
+/// intent belongs to the authenticated merchant and matches the leg exactly.
+fn mpesa_payment_status(
+    intent: Option<StkIntentStatus>,
+    leg: &SplitPayment,
+) -> ApiResult<&'static str> {
+    let Some(intent) = intent else {
+        return Err(ApiError::BadRequest(
+            "M-Pesa reference has no STK intent for this merchant".into(),
+        ));
+    };
+    if intent.amount_minor != leg.amount.amount_minor || intent.currency != leg.amount.currency.code
+    {
+        return Err(ApiError::BadRequest(
+            "M-Pesa intent does not match the payment leg".into(),
+        ));
+    }
+    Ok(match intent.status.as_str() {
+        "completed" => "approved",
+        "failed" => "failed",
+        _ => "pending",
+    })
+}
+
 /// Insert a sale + its payment legs atomically.
 /// Returns false on idempotency conflict, with no partial rows written.
-async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<bool> {
+async fn insert_sale(
+    pool: &PgPool,
+    sale: &Sale,
+    merchant_id: Uuid,
+    cashier_id: Uuid,
+) -> ApiResult<bool> {
     let payload = serde_json::to_value(sale)?;
     let mut tx: sqlx::Transaction<'_, sqlx::Postgres> = pool.begin().await?;
 
@@ -105,7 +141,7 @@ async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<
          ON CONFLICT (idempotency_key) DO NOTHING",
     )
     .bind(sale.id)
-    .bind(sale.merchant_id)
+    .bind(merchant_id)
     .bind(cashier_id)
     .bind(sale.idempotency_key)
     .bind(payload)
@@ -120,17 +156,20 @@ async fn insert_sale(pool: &PgPool, sale: &Sale, cashier_id: Uuid) -> ApiResult<
         // M-Pesa STK Push is confirmed asynchronously; carry the reconciled
         // intent status forward if a callback already arrived.
         let status = if payment.method == PaymentMethod::Mpesa {
-            let intent_status: Option<String> = sqlx::query_scalar(
-                "SELECT status FROM mpesa_stk_intents WHERE checkout_request_id = $1",
+            let intent = sqlx::query_as::<_, (String, i64, String)>(
+                "SELECT status, amount_minor, currency FROM mpesa_stk_intents
+                 WHERE checkout_request_id = $1 AND merchant_id = $2",
             )
             .bind(&payment.reference)
+            .bind(merchant_id)
             .fetch_optional(&mut *tx)
-            .await?;
-            match intent_status.as_deref() {
-                Some("completed") => "approved",
-                Some("failed") => "failed",
-                _ => "pending",
-            }
+            .await?
+            .map(|(status, amount_minor, currency)| StkIntentStatus {
+                status,
+                amount_minor,
+                currency,
+            });
+            mpesa_payment_status(intent, payment)?
         } else {
             "approved"
         };
@@ -193,4 +232,52 @@ pub async fn sync_events(
         }
     }
     Ok(Json(json!({ "accepted": accepted, "rejected": rejected })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pos_domain::money::{Currency, Money};
+
+    fn intent(status: &str, amount_minor: i64, currency: &str) -> StkIntentStatus {
+        StkIntentStatus {
+            status: status.into(),
+            amount_minor,
+            currency: currency.into(),
+        }
+    }
+
+    fn mpesa_leg(amount_minor: i64, currency: Currency) -> SplitPayment {
+        SplitPayment::new(
+            PaymentMethod::Mpesa,
+            Money::new(amount_minor, currency).unwrap(),
+            "ws_CO_1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mpesa_leg_status_comes_from_matching_intent() {
+        let leg = mpesa_leg(100_000, Currency::kes());
+        assert_eq!(
+            mpesa_payment_status(Some(intent("completed", 100_000, "KES")), &leg).unwrap(),
+            "approved"
+        );
+        assert_eq!(
+            mpesa_payment_status(Some(intent("failed", 100_000, "KES")), &leg).unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            mpesa_payment_status(Some(intent("pending", 100_000, "KES")), &leg).unwrap(),
+            "pending"
+        );
+    }
+
+    #[test]
+    fn mpesa_leg_rejects_unknown_or_mismatched_intent() {
+        let leg = mpesa_leg(100_000, Currency::kes());
+        assert!(mpesa_payment_status(None, &leg).is_err());
+        assert!(mpesa_payment_status(Some(intent("completed", 10_000, "KES")), &leg).is_err());
+        assert!(mpesa_payment_status(Some(intent("completed", 100_000, "USD")), &leg).is_err());
+    }
 }
