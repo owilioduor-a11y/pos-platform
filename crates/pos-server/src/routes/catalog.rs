@@ -37,6 +37,27 @@ pub struct ProductResponse {
     pub active: bool,
 }
 
+fn validate_tax_rate(rate: Decimal) -> ApiResult<Decimal> {
+    if rate < Decimal::ZERO || rate > Decimal::ONE {
+        return Err(ApiError::BadRequest(format!(
+            "tax_rate must be between 0 and 1; got {rate}"
+        )));
+    }
+    Ok(rate)
+}
+
+fn validate_stock_qty(qty: Option<i64>) -> ApiResult<Option<i64>> {
+    if let Some(q) = qty {
+        if q < 0 || q > i64::from(u32::MAX) {
+            return Err(ApiError::BadRequest(format!(
+                "stock_qty must be between 0 and {}; got {q}",
+                u32::MAX
+            )));
+        }
+    }
+    Ok(qty)
+}
+
 fn row_to_product(row: &sqlx::postgres::PgRow) -> ApiResult<ProductResponse> {
     Ok(ProductResponse {
         id: row.get::<Uuid, _>("id").to_string(),
@@ -91,11 +112,13 @@ pub async fn upsert_product(
         .to_ascii_uppercase();
     Currency::new(&currency, 2, "").map_err(ApiError::from)?;
     let tax_rate = match &req.tax_rate {
-        Some(raw) => raw
-            .parse::<Decimal>()
-            .map_err(|_| ApiError::BadRequest(format!("invalid tax_rate '{raw}'")))?,
+        Some(raw) => validate_tax_rate(
+            raw.parse::<Decimal>()
+                .map_err(|_| ApiError::BadRequest(format!("invalid tax_rate '{raw}'")))?,
+        )?,
         None => Decimal::new(16, 2),
     };
+    let stock_qty = validate_stock_qty(req.stock_qty)?;
 
     let row = sqlx::query(
         "INSERT INTO products
@@ -120,7 +143,7 @@ pub async fn upsert_product(
     .bind(req.price_minor)
     .bind(&currency)
     .bind(tax_rate.to_string())
-    .bind(req.stock_qty)
+    .bind(stock_qty)
     .bind(req.active.unwrap_or(true))
     .fetch_one(&pool)
     .await?;
@@ -141,6 +164,7 @@ pub async fn update_stock(
         .get("stock_qty")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| ApiError::BadRequest("stock_qty required".into()))?;
+    validate_stock_qty(Some(qty))?;
     let result = sqlx::query(
         "UPDATE products SET stock_qty = $1, updated_at = now()
          WHERE id = $2 AND merchant_id = $3",
@@ -154,4 +178,30 @@ pub async fn update_stock(
         return Err(ApiError::NotFound);
     }
     Ok(Json(json!({ "updated": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tax_rate_must_be_a_fraction() {
+        assert!(validate_tax_rate(Decimal::ZERO).is_ok());
+        assert!(validate_tax_rate(Decimal::new(16, 2)).is_ok());
+        assert_eq!(validate_tax_rate(Decimal::ONE).unwrap(), Decimal::ONE);
+        assert!(validate_tax_rate(Decimal::new(-1, 2)).is_err());
+        assert!(validate_tax_rate(Decimal::new(150, 2)).is_err());
+    }
+
+    #[test]
+    fn stock_qty_must_fit_domain_u32() {
+        assert!(validate_stock_qty(None).is_ok());
+        assert_eq!(validate_stock_qty(Some(0)).unwrap(), Some(0));
+        assert_eq!(
+            validate_stock_qty(Some(i64::from(u32::MAX))).unwrap(),
+            Some(i64::from(u32::MAX))
+        );
+        assert!(validate_stock_qty(Some(-1)).is_err());
+        assert!(validate_stock_qty(Some(i64::from(u32::MAX) + 1)).is_err());
+    }
 }
