@@ -96,6 +96,9 @@ struct DarajaCallback {
     checkout_request_id: String,
     result_code: i64,
     receipt_number: Option<String>,
+    /// Whole KES, as reported by Daraja (we send `amount_minor / 100`).
+    amount_kes: Option<i64>,
+    phone: Option<String>,
 }
 
 fn mask_phone(phone: &str) -> String {
@@ -105,6 +108,17 @@ fn mask_phone(phone: &str) -> String {
     } else {
         format!("****{}", &digits[digits.len() - 4..])
     }
+}
+
+fn callback_metadata<'a>(stk: &'a Value, name: &str) -> Option<&'a Value> {
+    stk.pointer("/CallbackMetadata/Item")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("Name").and_then(Value::as_str) == Some(name))
+        })
+        .and_then(|item| item.get("Value"))
 }
 
 fn parse_daraja_callback(payload: &Value) -> ApiResult<DarajaCallback> {
@@ -121,23 +135,51 @@ fn parse_daraja_callback(payload: &Value) -> ApiResult<DarajaCallback> {
         .get("ResultCode")
         .and_then(Value::as_i64)
         .ok_or_else(|| ApiError::BadRequest("missing Daraja ResultCode".into()))?;
-    let receipt_number = stk
-        .pointer("/CallbackMetadata/Item")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("Name").and_then(Value::as_str) == Some("MpesaReceiptNumber"))
-        })
-        .and_then(|item| item.get("Value"))
+    let receipt_number = callback_metadata(stk, "MpesaReceiptNumber")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let amount_kes = callback_metadata(stk, "Amount").and_then(|value| match value {
+        Value::Number(amount) => amount.as_i64(),
+        Value::String(amount) => amount.trim().parse::<i64>().ok(),
+        _ => None,
+    });
+    // Daraja has shipped this field as both a JSON string and a number.
+    let phone = callback_metadata(stk, "PhoneNumber").and_then(|value| match value {
+        Value::String(phone) if !phone.is_empty() => Some(phone.clone()),
+        Value::Number(phone) => Some(phone.to_string()),
+        _ => None,
+    });
     Ok(DarajaCallback {
         checkout_request_id,
         result_code,
         receipt_number,
+        amount_kes,
+        phone,
     })
+}
+
+/// Daraja callbacks are unsigned. A callback is only trusted when it agrees
+/// with the STK intent we created — including the amount and the payer for a
+/// successful result — not merely because it carried a known request id.
+fn callback_matches_intent(
+    callback: &DarajaCallback,
+    intent_amount_minor: i64,
+    intent_phone_masked: &str,
+) -> bool {
+    if callback.result_code != 0 {
+        return true;
+    }
+    if callback.receipt_number.is_none() {
+        return false;
+    }
+    if callback.amount_kes != Some(intent_amount_minor / 100) {
+        return false;
+    }
+    callback
+        .phone
+        .as_deref()
+        .is_none_or(|phone| mask_phone(phone) == intent_phone_masked)
 }
 
 struct StkIntent<'a> {
@@ -519,8 +561,9 @@ pub async fn mpesa_status(
 
 /// POST /api/v1/webhooks/daraja — Safaricom STK callback.
 /// Public route: Safaricom callbacks are unsigned, so the result is accepted
-/// only when the CheckoutRequestID matches a stored STK intent. Replays are
-/// deduped by that same id.
+/// only after it matches the stored STK intent (id, amount and payer). Replays
+/// are deduped by CheckoutRequestID, but only validated callbacks are recorded
+/// so a spoofed event cannot block the genuine one.
 pub async fn daraja_webhook(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -529,6 +572,28 @@ pub async fn daraja_webhook(
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("invalid JSON body".into()))?;
     let callback = parse_daraja_callback(&parsed)?;
+
+    let intent = sqlx::query_as::<_, (i64, String)>(
+        "SELECT amount_minor, phone_masked FROM mpesa_stk_intents
+         WHERE checkout_request_id = $1",
+    )
+    .bind(&callback.checkout_request_id)
+    .fetch_optional(&pool)
+    .await?;
+    let Some((intent_amount_minor, intent_phone_masked)) = intent else {
+        tracing::warn!(
+            checkout_request_id = %callback.checkout_request_id,
+            "ignoring Daraja callback without a matching STK intent"
+        );
+        return Ok(Json(json!({ "ResultCode": 0, "ResultDesc": "ignored" })));
+    };
+    if !callback_matches_intent(&callback, intent_amount_minor, &intent_phone_masked) {
+        tracing::warn!(
+            checkout_request_id = %callback.checkout_request_id,
+            "rejecting Daraja callback that disagrees with the STK intent"
+        );
+        return Ok(Json(json!({ "ResultCode": 0, "ResultDesc": "rejected" })));
+    }
 
     let result = sqlx::query(
         "INSERT INTO webhook_events (provider, event_id, payload_json) VALUES ('daraja', $1, $2)
@@ -701,7 +766,11 @@ mod tests {
                     "CheckoutRequestID": "ws_CO_123",
                     "ResultCode": 0,
                     "CallbackMetadata": {
-                        "Item": [{ "Name": "MpesaReceiptNumber", "Value": "QX7ABC1" }]
+                        "Item": [
+                            { "Name": "MpesaReceiptNumber", "Value": "QX7ABC1" },
+                            { "Name": "Amount", "Value": 1000 },
+                            { "Name": "PhoneNumber", "Value": 254712345678_i64 }
+                        ]
                     }
                 }
             }
@@ -712,6 +781,8 @@ mod tests {
                 checkout_request_id: "ws_CO_123".into(),
                 result_code: 0,
                 receipt_number: Some("QX7ABC1".into()),
+                amount_kes: Some(1000),
+                phone: Some("254712345678".into()),
             }
         );
         assert!(
@@ -721,6 +792,95 @@ mod tests {
             &json!({"Body": {"stkCallback": {"CheckoutRequestID": "ws_CO_123"}}})
         )
         .is_err());
+    }
+
+    fn success_callback(
+        amount_kes: Option<i64>,
+        phone: Option<&str>,
+        with_receipt: bool,
+    ) -> DarajaCallback {
+        DarajaCallback {
+            checkout_request_id: "ws_CO_123".into(),
+            result_code: 0,
+            receipt_number: with_receipt.then(|| "QX7ABC1".into()),
+            amount_kes,
+            phone: phone.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn daraja_success_callback_must_match_intent_amount_and_payer() {
+        assert!(callback_matches_intent(
+            &success_callback(Some(1000), Some("254712345678"), true),
+            100_000,
+            "****5678"
+        ));
+        // A missing phone in CallbackMetadata is tolerated, but a wrong one is not.
+        assert!(callback_matches_intent(
+            &success_callback(Some(1000), None, true),
+            100_000,
+            "****5678"
+        ));
+        assert!(!callback_matches_intent(
+            &success_callback(Some(999), Some("254712345678"), true),
+            100_000,
+            "****5678"
+        ));
+        assert!(!callback_matches_intent(
+            &success_callback(Some(1000), Some("254700000000"), true),
+            100_000,
+            "****5678"
+        ));
+        assert!(!callback_matches_intent(
+            &success_callback(Some(1000), Some("254712345678"), false),
+            100_000,
+            "****5678"
+        ));
+        assert!(!callback_matches_intent(
+            &success_callback(None, Some("254712345678"), true),
+            100_000,
+            "****5678"
+        ));
+    }
+
+    #[test]
+    fn daraja_failure_callback_needs_only_the_matching_request_id() {
+        let callback = DarajaCallback {
+            checkout_request_id: "ws_CO_123".into(),
+            result_code: 1,
+            receipt_number: None,
+            amount_kes: None,
+            phone: None,
+        };
+        assert!(callback_matches_intent(&callback, 100_000, "****5678"));
+    }
+
+    #[test]
+    fn daraja_accepts_string_or_numeric_amount() {
+        let fixture = |value: Value| {
+            json!({
+                "Body": { "stkCallback": {
+                    "CheckoutRequestID": "ws_CO_123",
+                    "ResultCode": 0,
+                    "CallbackMetadata": { "Item": [
+                        { "Name": "MpesaReceiptNumber", "Value": "QX7ABC1" },
+                        { "Name": "Amount", "Value": value }
+                    ]}
+                }}
+            })
+        };
+        assert_eq!(
+            parse_daraja_callback(&fixture(json!(1000)))
+                .unwrap()
+                .amount_kes,
+            Some(1000)
+        );
+        assert_eq!(
+            parse_daraja_callback(&fixture(json!("1000")))
+                .unwrap()
+                .amount_kes,
+            Some(1000)
+        );
     }
 
     #[test]
