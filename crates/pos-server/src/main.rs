@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         pool,
         config: config.clone(),
-        gateways: GatewaySet::from_config(&config),
+        gateways: GatewaySet::from_config(&config)?,
     });
 
     let app = build_router(state, config);

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::gateways::payment_http_client;
 use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
@@ -36,22 +37,22 @@ pub fn whole_kes_amount(amount_minor: i64) -> DomainResult<i64> {
 }
 
 impl DarajaClient {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config) -> DomainResult<Self> {
         let base_url = if config.daraja_env.eq_ignore_ascii_case("production") {
             "https://api.safaricom.co.ke"
         } else {
             "https://sandbox.safaricom.co.ke"
         }
         .to_string();
-        Self {
-            http: reqwest::Client::new(),
+        Ok(Self {
+            http: payment_http_client()?,
             base_url,
             consumer_key: config.daraja_consumer_key.clone(),
             consumer_secret: config.daraja_consumer_secret.clone(),
             passkey: config.daraja_passkey.clone(),
             shortcode: config.daraja_shortcode.clone(),
             callback_url: config.daraja_callback_url.clone(),
-        }
+        })
     }
 
     async fn access_token(&self) -> DomainResult<String> {

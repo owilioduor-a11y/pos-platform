@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::gateways::payment_http_client;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use pos_domain::money::Money;
@@ -41,16 +42,16 @@ pub struct CardAcquirerClient {
 }
 
 impl CardAcquirerClient {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config) -> DomainResult<Self> {
         let mock = config.acquirer_provider == "mock" || config.acquirer_api_url.is_empty();
-        Self {
-            http: reqwest::Client::new(),
+        Ok(Self {
+            http: payment_http_client()?,
             api_url: config.acquirer_api_url.trim_end_matches('/').to_string(),
             api_key: config.acquirer_api_key.clone(),
             webhook_secret: config.acquirer_webhook_secret.clone(),
             provider_name: "kenya_acquirer",
             mock,
-        }
+        })
     }
 
     async fn charge_remote(&self, req: &PaymentRequest) -> DomainResult<PaymentReceipt> {
