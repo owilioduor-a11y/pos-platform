@@ -2,7 +2,7 @@ use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri};
 use axum::Json;
 use pos_domain::money::{Currency, Money};
 use pos_domain::payment::{PaymentGateway, PaymentReceipt, PaymentRequest};
@@ -118,6 +118,13 @@ fn mask_phone(phone: &str) -> String {
     } else {
         format!("****{}", &digits[digits.len() - 4..])
     }
+}
+
+fn query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then_some(value)
+    })
 }
 
 fn callback_metadata<'a>(stk: &'a Value, name: &str) -> Option<&'a Value> {
@@ -631,27 +638,46 @@ pub async fn mpesa_status(
 
 /// POST /api/v1/webhooks/daraja — Safaricom STK callback.
 /// Public route: Safaricom callbacks are unsigned, so the result is accepted
-/// only after it matches the stored STK intent (id, amount and payer). Replays
-/// are deduped by CheckoutRequestID, but only validated callbacks are recorded
-/// so a spoofed event cannot block the genuine one.
+/// only after the per-request URL token validates and the payload matches the
+/// stored STK intent (id, amount and payer). Replays are deduped by
+/// CheckoutRequestID, but only validated callbacks are recorded so a spoofed
+/// event cannot block the genuine one.
 pub async fn daraja_webhook(
     State(state): State<Arc<AppState>>,
+    uri: Uri,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let mpesa = state
+        .gateways
+        .mpesa
+        .as_ref()
+        .ok_or(ApiError::PaymentFailed(
+            "M-Pesa gateway not configured".into(),
+        ))?;
+    let provided_token = query_param(uri.query(), "stk_token");
+    if mpesa.callback_token_required() && provided_token.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
     let pool = state.pool.clone();
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("invalid JSON body".into()))?;
     let callback = parse_daraja_callback(&parsed)?;
 
-    let intent = sqlx::query_as::<_, (Uuid, i64, String, String)>(
-        "SELECT merchant_id, amount_minor, currency, phone_masked FROM mpesa_stk_intents
+    let intent = sqlx::query_as::<_, (Uuid, Uuid, i64, String, String)>(
+        "SELECT merchant_id, idempotency_key, amount_minor, currency, phone_masked
+         FROM mpesa_stk_intents
          WHERE checkout_request_id = $1",
     )
     .bind(&callback.checkout_request_id)
     .fetch_optional(&pool)
     .await?;
-    let Some((intent_merchant_id, intent_amount_minor, intent_currency, intent_phone_masked)) =
-        intent
+    let Some((
+        intent_merchant_id,
+        intent_idempotency_key,
+        intent_amount_minor,
+        intent_currency,
+        intent_phone_masked,
+    )) = intent
     else {
         tracing::warn!(
             checkout_request_id = %callback.checkout_request_id,
@@ -659,6 +685,18 @@ pub async fn daraja_webhook(
         );
         return Ok(Json(json!({ "ResultCode": 0, "ResultDesc": "ignored" })));
     };
+    if let Some(provided_token) = provided_token {
+        if !mpesa
+            .verify_callback_token(intent_idempotency_key, provided_token)
+            .map_err(|_| ApiError::Unauthorized)?
+        {
+            tracing::warn!(
+                checkout_request_id = %callback.checkout_request_id,
+                "rejecting Daraja callback with an invalid URL token"
+            );
+            return Err(ApiError::Unauthorized);
+        }
+    }
     if !callback_matches_intent(&callback, intent_amount_minor, &intent_phone_masked) {
         tracing::warn!(
             checkout_request_id = %callback.checkout_request_id,
@@ -788,6 +826,16 @@ mod tests {
         assert!(validate_mpesa_amount(&Money::new(100_000, Currency::kes()).unwrap()).is_ok());
         assert!(validate_mpesa_amount(&Money::new(100_050, Currency::kes()).unwrap()).is_err());
         assert!(validate_mpesa_amount(&Money::new(100_000, Currency::usd()).unwrap()).is_err());
+    }
+
+    #[test]
+    fn callback_token_query_param_is_parsed() {
+        assert_eq!(
+            query_param(Some("source=daraja&stk_token=abc123"), "stk_token"),
+            Some("abc123")
+        );
+        assert_eq!(query_param(None, "stk_token"), None);
+        assert_eq!(query_param(Some("other=abc123"), "stk_token"), None);
     }
 
     #[test]

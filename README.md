@@ -60,3 +60,5 @@ POS_MERCHANT_ID='00000000-0000-7000-8000-000000000001' \
 ```
 
 Never commit real tokens to `android/gradle.properties` (it is tracked); prefer environment variables.
+
+Daraja callbacks are unsigned, so each STK Push embeds an HMAC token bound to its idempotency key in the HTTPS callback URL. Production requires `DARAJA_CALLBACK_SECRET` (at least 32 chars) and rejects callbacks whose token does not match the stored intent.

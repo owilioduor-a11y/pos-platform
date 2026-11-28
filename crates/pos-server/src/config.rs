@@ -17,6 +17,9 @@ pub struct Config {
     pub daraja_passkey: String,
     pub daraja_shortcode: String,
     pub daraja_callback_url: String,
+    /// Secret used to tokenize each per-request Daraja callback URL. Daraja
+    /// callbacks are unsigned, so the token is the callback authenticator.
+    pub daraja_callback_secret: String,
 
     // Card acquirer (Kenya partner / global PSP)
     pub acquirer_provider: String,
@@ -57,6 +60,10 @@ impl std::fmt::Debug for Config {
             .field("daraja_passkey", &redacted(&self.daraja_passkey))
             .field("daraja_shortcode", &redacted(&self.daraja_shortcode))
             .field("daraja_callback_url", &redacted(&self.daraja_callback_url))
+            .field(
+                "daraja_callback_secret",
+                &redacted(&self.daraja_callback_secret),
+            )
             .field("acquirer_provider", &self.acquirer_provider)
             .field("acquirer_api_url", &redacted(&self.acquirer_api_url))
             .field("acquirer_api_key", &redacted(&self.acquirer_api_key))
@@ -101,6 +108,7 @@ impl Config {
             daraja_passkey: env("DARAJA_PASSKEY", ""),
             daraja_shortcode: env("DARAJA_SHORTCODE", ""),
             daraja_callback_url: env("DARAJA_CALLBACK_URL", ""),
+            daraja_callback_secret: env("DARAJA_CALLBACK_SECRET", ""),
             acquirer_provider: env("KENYA_ACQUIRER_PROVIDER", "mock"),
             acquirer_api_url: env("KENYA_ACQUIRER_API_URL", ""),
             acquirer_api_key: env("KENYA_ACQUIRER_API_KEY", ""),
@@ -157,6 +165,12 @@ impl Config {
                 if !self.daraja_callback_url.starts_with("https://") {
                     bail!("DARAJA_CALLBACK_URL must be an https URL in production");
                 }
+                if self.daraja_callback_secret.is_empty() {
+                    bail!("production requires DARAJA_CALLBACK_SECRET");
+                }
+                if self.daraja_callback_secret.len() < 32 {
+                    bail!("DARAJA_CALLBACK_SECRET must be at least 32 chars in production");
+                }
             }
         }
         Ok(())
@@ -185,6 +199,7 @@ mod tests {
             daraja_passkey: "mpesa_passkey".into(),
             daraja_shortcode: "174379".into(),
             daraja_callback_url: "http://localhost/callback".into(),
+            daraja_callback_secret: "dev-callback-secret".into(),
             acquirer_provider: "mock".into(),
             acquirer_api_url: "".into(),
             acquirer_api_key: "".into(),
@@ -206,6 +221,7 @@ mod tests {
         config.acquirer_webhook_secret = "webhook_secret".into();
         config.daraja_env = "production".into();
         config.daraja_callback_url = "https://pos.example/callback".into();
+        config.daraja_callback_secret = "x".repeat(32);
         config
     }
 
@@ -229,6 +245,17 @@ mod tests {
     }
 
     #[test]
+    fn production_requires_a_strong_daraja_callback_secret() {
+        let mut config = production_config();
+        config.daraja_callback_secret.clear();
+        assert!(config.validate().is_err());
+
+        let mut config = production_config();
+        config.daraja_callback_secret = "short".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn production_rejects_short_jwt_secret() {
         let mut config = production_config();
         config.jwt_secret = "short".into();
@@ -241,6 +268,7 @@ mod tests {
         assert!(!rendered.contains("db_password"));
         assert!(!rendered.contains("dev-secret"));
         assert!(!rendered.contains("mpesa_secret"));
+        assert!(!rendered.contains("dev-callback-secret"));
         assert!(!rendered.contains("acquirer_key"));
         assert!(rendered.contains("<redacted>"));
     }

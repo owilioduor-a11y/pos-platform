@@ -170,6 +170,7 @@ mod tests {
             daraja_passkey: "".into(),
             daraja_shortcode: "".into(),
             daraja_callback_url: "".into(),
+            daraja_callback_secret: "".into(),
             acquirer_provider: "mock".into(),
             acquirer_api_url: "".into(),
             acquirer_api_key: "".into(),
