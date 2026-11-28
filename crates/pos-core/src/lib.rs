@@ -314,10 +314,13 @@ impl PosCore {
         let idempotency_key = parse_idempotency_key(&idempotency_key)?;
 
         let engine = TaxEngine::kenya_vat(TaxMode::Inclusive);
-        let cart = lock_cart(&self.cart).clone();
-        if cart.is_empty() {
+        // Hold the cart lock across the whole commit, not just the snapshot.
+        // Otherwise two callers can sell the same cart or clear a newer one.
+        let mut cart_guard = lock_cart(&self.cart);
+        if cart_guard.is_empty() {
             return Err(PosCoreError::InvalidInput("cart is empty".into()));
         }
+        let cart = cart_guard.clone();
 
         let mut sale = finalize_sale(
             &cart,
@@ -356,13 +359,13 @@ impl PosCore {
 
         match outcome {
             repository::CheckoutCommit::Inserted => {
-                *lock_cart(&self.cart) = Cart::new();
+                *cart_guard = Cart::new();
                 Ok(sale.id.to_string())
             }
             repository::CheckoutCommit::Duplicate(existing_id) => {
                 // Retry with the same key: keep the original sale and do not
                 // deduct stock or enqueue a second outbox row.
-                *lock_cart(&self.cart) = Cart::new();
+                *cart_guard = Cart::new();
                 Ok(existing_id.to_string())
             }
             repository::CheckoutCommit::StockShortage(shortage) => {
@@ -432,6 +435,7 @@ impl PosCore {
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+    use std::sync::Barrier;
 
     fn test_core() -> Arc<PosCore> {
         PosCore::new(
@@ -464,6 +468,35 @@ mod tests {
         core.set_adhoc_amount(1000, "KES".into()).unwrap();
         let second = core.checkout(legs.to_string(), key).unwrap();
         assert_eq!(first, second);
+        assert_eq!(count_rows(&core, "sales"), 1);
+        assert_eq!(count_rows(&core, "sync_outbox"), 1);
+    }
+
+    #[test]
+    fn concurrent_checkouts_cannot_sell_the_same_cart_twice() {
+        let core = test_core();
+        core.set_adhoc_amount(1000, "KES".into()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let legs = r#"[{"method":"cash","amount_minor":1000,"reference":"cash_race"}]"#.to_string();
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let core = Arc::clone(&core);
+                let barrier = Arc::clone(&barrier);
+                let legs = legs.clone();
+                let key = core.new_idempotency_key();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    core.checkout(legs, key)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(count_rows(&core, "sales"), 1);
         assert_eq!(count_rows(&core, "sync_outbox"), 1);
     }
