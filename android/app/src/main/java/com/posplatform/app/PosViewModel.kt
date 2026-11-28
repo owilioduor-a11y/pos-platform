@@ -3,7 +3,7 @@ package com.posplatform.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.posplatform.app.network.ApiClient
-import com.posplatform.app.softpos.MockTapToPayManager
+import com.posplatform.app.softpos.TapToPayFactory
 import com.posplatform.app.softpos.TapToPayManager
 import java.net.URLEncoder
 import java.util.UUID
@@ -41,7 +41,8 @@ class PosViewModel : ViewModel() {
 
     private val apiClient: ApiClient by lazy { ApiClient(SERVER_URL, API_TOKEN) }
 
-    private val tapManager: TapToPayManager = MockTapToPayManager()
+    // Release builds must never approve a tap through the development simulator.
+    private val tapManager: TapToPayManager = TapToPayFactory.create(BuildConfig.DEBUG)
 
     private val _merchantMode = MutableStateFlow(MerchantMode.MICRO)
     val merchantMode: StateFlow<MerchantMode> = _merchantMode.asStateFlow()

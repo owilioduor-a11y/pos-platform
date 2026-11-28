@@ -94,6 +94,10 @@ jobs:
           fi
           grep -q "Release builds require" "$RUNNER_TEMP/release-config.log"
 
+      - name: Run JVM unit tests
+        working-directory: android
+        run: gradle testDebugUnitTest --no-daemon
+
       - name: Build debug APK
         working-directory: android
         run: gradle assembleDebug --no-daemon

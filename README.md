@@ -48,6 +48,8 @@ Environment variables take precedence over `-P` properties. Debug builds work ou
 
 Release builds **fail closed**: `validateReleaseConfig` runs before resource processing and rejects missing values, plaintext `http://` URLs, the `dev-token` placeholder, short tokens, and non-UUID merchant IDs. The app repeats those checks at startup, so a misconfigured release APK cannot silently talk to a development backend.
 
+The tap kernel is selected by `BuildConfig.DEBUG`. Debug builds may use `MockTapToPayManager`; release builds get `UnavailableTapToPayManager`, which declines every tap until a certified acquirer SoftPOS AAR is wired into `TapToPayFactory`. A release APK can never approve a card payment with simulated EMV data.
+
 TLS is also enforced by the OS: `src/main/res/xml/network_security_config.xml` blocks cleartext and trusts only system CAs. The debug source set overlays it to allow the emulator's `http://10.0.2.2:8080` backend.
 
 ```bash
