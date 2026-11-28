@@ -19,6 +19,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,6 +60,13 @@ fun RetailCatalogScreen(
     val totalMinor by viewModel.cartTotalMinor.collectAsState()
     val message by viewModel.lastMessage.collectAsState()
     var showScanner by remember { mutableStateOf(false) }
+    var scanner by remember { mutableStateOf<BarcodeScanner?>(null) }
+
+    DisposableEffect(showScanner) {
+        onDispose {
+            scanner?.shutdown()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -94,10 +102,10 @@ fun RetailCatalogScreen(
             AndroidView(
                 factory = { ctx ->
                     PreviewView(ctx).also { preview ->
-                        BarcodeScanner(ctx) { code ->
+                        scanner = BarcodeScanner(ctx) { code ->
                             viewModel.scanBarcode(code)
                             showScanner = false
-                        }.bindToLifecycle(lifecycleOwner, preview)
+                        }.also { it.bindToLifecycle(lifecycleOwner, preview) }
                     }
                 },
                 modifier = Modifier
