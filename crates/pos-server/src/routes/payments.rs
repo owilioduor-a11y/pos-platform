@@ -328,7 +328,8 @@ fn reservation_error(reservation: &AttemptReservation) -> ApiError {
             "payment with this idempotency key is already in progress; retry shortly".into(),
         ),
         AttemptReservation::Failed => ApiError::PaymentFailed(
-            "previous attempt with this idempotency key failed; use a new key".into(),
+            "previous attempt with this idempotency key did not complete; reconcile before using a new key"
+                .into(),
         ),
         AttemptReservation::Mismatch => ApiError::Conflict(
             "idempotency key was already used for a different payment request".into(),
@@ -382,6 +383,24 @@ async fn fail_attempt(pool: &PgPool, merchant_id: Uuid, idempotency_key: Uuid) -
         ));
     }
     Ok(())
+}
+
+/// Best-effort release after a provider call succeeded but local persistence
+/// failed. Marking the attempt failed blocks reuse of the same key (avoiding a
+/// duplicate charge) while preventing a permanently stuck `in_progress` row.
+async fn release_attempt_after_local_error(
+    pool: &PgPool,
+    merchant_id: Uuid,
+    idempotency_key: Uuid,
+    stage: &str,
+) {
+    if let Err(error) = fail_attempt(pool, merchant_id, idempotency_key).await {
+        tracing::error!(
+            error = %error,
+            stage,
+            "could not release payment attempt after local failure"
+        );
+    }
 }
 
 /// POST /api/v1/payments/charge — route a payment to the regional gateway.
@@ -445,7 +464,19 @@ pub async fn charge(
     };
     let response = charge_response(&receipt, state.gateways.provider_for(method));
     let response =
-        complete_attempt(&state.pool, user.merchant_id, idempotency_key, &response).await?;
+        match complete_attempt(&state.pool, user.merchant_id, idempotency_key, &response).await {
+            Ok(response) => response,
+            Err(error) => {
+                release_attempt_after_local_error(
+                    &state.pool,
+                    user.merchant_id,
+                    idempotency_key,
+                    "complete_attempt",
+                )
+                .await;
+                return Err(error);
+            }
+        };
     Ok(Json(response))
 }
 
@@ -505,7 +536,7 @@ pub async fn mpesa_stkpush(
     };
     let payload = receipt.raw_provider_payload;
     if receipt.approved {
-        store_stk_intent(
+        if let Err(error) = store_stk_intent(
             &state.pool,
             &StkIntent {
                 merchant_id: user.merchant_id,
@@ -517,7 +548,17 @@ pub async fn mpesa_stkpush(
                 payload: &payload,
             },
         )
-        .await?;
+        .await
+        {
+            release_attempt_after_local_error(
+                &state.pool,
+                user.merchant_id,
+                idempotency_key,
+                "store_stk_intent",
+            )
+            .await;
+            return Err(error);
+        }
     }
     let response = json!({
         "approved": receipt.approved,
@@ -529,7 +570,19 @@ pub async fn mpesa_stkpush(
         "account_ref": account_ref,
     });
     let response =
-        complete_attempt(&state.pool, user.merchant_id, idempotency_key, &response).await?;
+        match complete_attempt(&state.pool, user.merchant_id, idempotency_key, &response).await {
+            Ok(response) => response,
+            Err(error) => {
+                release_attempt_after_local_error(
+                    &state.pool,
+                    user.merchant_id,
+                    idempotency_key,
+                    "complete_attempt",
+                )
+                .await;
+                return Err(error);
+            }
+        };
     Ok(Json(response))
 }
 
