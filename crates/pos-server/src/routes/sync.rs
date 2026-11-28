@@ -5,7 +5,6 @@ use axum::Json;
 use pos_domain::sale::{Sale, SplitPayment};
 use pos_domain::PaymentMethod;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -15,9 +14,8 @@ use crate::AppState;
 /// Batch item pushed by pos-core's sync outbox.
 #[derive(Debug, Deserialize)]
 pub struct SyncItem {
-    /// Outbox row id from the device — used for tracing only; dedupe is
-    /// handled by the sales.idempotency_key UNIQUE constraint.
-    #[allow(dead_code)]
+    /// Outbox row id from the device, echoed back so the client can clear only
+    /// rows the server actually accepted.
     pub id: i64,
     pub kind: String,
     pub payload: serde_json::Value,
@@ -33,6 +31,25 @@ pub struct SyncResponse {
     pub accepted: usize,
     pub duplicates: usize,
     pub rejected: usize,
+    /// Per-row outcome, enabling the device to drop accepted rows without
+    /// leaving a rejected row wedged at the head of the outbox forever.
+    pub results: Vec<SyncItemResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncItemResult {
+    pub id: i64,
+    pub status: &'static str,
+}
+
+fn record_result(
+    results: &mut Vec<SyncItemResult>,
+    counter: &mut usize,
+    id: i64,
+    status: &'static str,
+) {
+    *counter += 1;
+    results.push(SyncItemResult { id, status });
 }
 
 /// POST /api/v1/sync/sales — idempotent batch ingestion of completed sales.
@@ -46,42 +63,43 @@ pub async fn sync_sales(
     let mut accepted = 0usize;
     let mut duplicates = 0usize;
     let mut rejected = 0usize;
+    let mut results = Vec::with_capacity(req.items.len());
 
     for item in req.items {
         if item.kind != "sale" {
-            rejected += 1;
+            record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
         let sale: Sale = match serde_json::from_value(item.payload.clone()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "unparseable sale payload");
-                rejected += 1;
+                record_result(&mut results, &mut rejected, item.id, "rejected");
                 continue;
             }
         };
         // Never trust client-supplied merchant/cashier ids over the token.
         if sale.merchant_id != user.merchant_id {
-            rejected += 1;
+            record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
         if sale.idempotency_key.get_version_num() != 7 {
             tracing::warn!(sale_id = %sale.id, "sale idempotency key is not UUIDv7");
-            rejected += 1;
+            record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
         if let Err(e) = sale.validate_payments() {
             tracing::warn!(sale_id = %sale.id, error = %e, "invalid sale payments");
-            rejected += 1;
+            record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
 
         match insert_sale(&pool, &sale, user.merchant_id, user.user_id).await {
-            Ok(true) => accepted += 1,
-            Ok(false) => duplicates += 1,
+            Ok(true) => record_result(&mut results, &mut accepted, item.id, "accepted"),
+            Ok(false) => record_result(&mut results, &mut duplicates, item.id, "duplicate"),
             Err(e) => {
                 tracing::warn!(error = %e, "sale insert failed");
-                rejected += 1;
+                record_result(&mut results, &mut rejected, item.id, "rejected");
             }
         }
     }
@@ -90,6 +108,7 @@ pub async fn sync_sales(
         accepted,
         duplicates,
         rejected,
+        results,
     }))
 }
 
@@ -204,15 +223,17 @@ pub async fn sync_events(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(req): Json<SyncRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SyncResponse>> {
     let pool = state.pool.clone();
     let mut accepted = 0usize;
+    let duplicates = 0usize;
     let mut rejected = 0usize;
+    let mut results = Vec::with_capacity(req.items.len());
     for item in req.items {
         if !matches!(item.kind.as_str(), "tap" | "inventory") {
             // Sales must go through /sync/sales; other kinds are unknown.
             tracing::warn!(kind = %item.kind, "rejecting unsupported sync event");
-            rejected += 1;
+            record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
         let result = sqlx::query(
@@ -224,14 +245,19 @@ pub async fn sync_events(
         .execute(&pool)
         .await;
         match result {
-            Ok(_) => accepted += 1,
+            Ok(_) => record_result(&mut results, &mut accepted, item.id, "accepted"),
             Err(e) => {
                 tracing::warn!(error = %e, kind = %item.kind, "event insert failed");
-                rejected += 1;
+                record_result(&mut results, &mut rejected, item.id, "rejected");
             }
         }
     }
-    Ok(Json(json!({ "accepted": accepted, "rejected": rejected })))
+    Ok(Json(SyncResponse {
+        accepted,
+        duplicates,
+        rejected,
+        results,
+    }))
 }
 
 #[cfg(test)]
@@ -271,6 +297,19 @@ mod tests {
             mpesa_payment_status(Some(intent("pending", 100_000, "KES")), &leg).unwrap(),
             "pending"
         );
+    }
+
+    #[test]
+    fn sync_results_track_each_outbox_row() {
+        let mut results = Vec::new();
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        record_result(&mut results, &mut accepted, 7, "accepted");
+        record_result(&mut results, &mut rejected, 9, "rejected");
+        assert_eq!(accepted, 1);
+        assert_eq!(rejected, 1);
+        assert_eq!(results[0].id, 7);
+        assert_eq!(results[1].status, "rejected");
     }
 
     #[test]
