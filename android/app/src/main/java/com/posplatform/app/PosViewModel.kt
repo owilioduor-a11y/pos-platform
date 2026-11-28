@@ -41,6 +41,12 @@ class PosViewModel : ViewModel() {
 
     private val apiClient: ApiClient by lazy { ApiClient(SERVER_URL, API_TOKEN) }
 
+    // SQLite/UniFFI calls are synchronous and blocking. Keep them off Main and
+    // serialized so cart mutations and checkout cannot interleave.
+    private val engineContext = Dispatchers.IO.limitedParallelism(1)
+
+    private suspend fun <T> onEngine(block: () -> T): T = withContext(engineContext) { block() }
+
     // Release builds must never approve a tap through the development simulator.
     private val tapManager: TapToPayManager = TapToPayFactory.create(BuildConfig.DEBUG)
 
@@ -60,7 +66,7 @@ class PosViewModel : ViewModel() {
     val lastMessage: StateFlow<String?> = _lastMessage.asStateFlow()
 
     init {
-        refreshCart()
+        viewModelScope.launch { refreshCart() }
     }
 
     fun setMode(mode: MerchantMode) {
@@ -69,26 +75,37 @@ class PosViewModel : ViewModel() {
 
     /** Quick Charge: set an ad-hoc amount (minor units) for Micro mode. */
     fun setAdhocAmount(amountMinor: Long) {
-        runCatching {
-            engine.setAdhocAmount(amountMinor, CURRENCY)
-        }.onSuccess { refreshCart() }
-            .onFailure { _lastMessage.value = it.message }
+        viewModelScope.launch {
+            try {
+                onEngine { engine.setAdhocAmount(amountMinor, CURRENCY) }
+                refreshCart()
+            } catch (e: Exception) {
+                _lastMessage.value = e.message
+            }
+        }
     }
 
     fun scanBarcode(barcode: String) {
         viewModelScope.launch {
-            runCatching { engine.scanBarcode(barcode) }
-                .onSuccess { found ->
-                    if (!found) _lastMessage.value = "Unknown barcode: $barcode"
-                    refreshCart()
-                }
-                .onFailure { _lastMessage.value = it.message }
+            try {
+                val found = onEngine { engine.scanBarcode(barcode) }
+                if (!found) _lastMessage.value = "Unknown barcode: $barcode"
+                refreshCart()
+            } catch (e: Exception) {
+                _lastMessage.value = e.message
+            }
         }
     }
 
     fun clearCart() {
-        engine.clearCart()
-        refreshCart()
+        viewModelScope.launch {
+            try {
+                onEngine { engine.clearCart() }
+                refreshCart()
+            } catch (e: Exception) {
+                _lastMessage.value = e.message
+            }
+        }
     }
 
     /**
@@ -108,15 +125,17 @@ class PosViewModel : ViewModel() {
 
             if (result.approved) {
                 // Record masked EMV metadata — never PAN/CVV.
-                engine.recordTap(
-                    amountMinor = total,
-                    currencyCode = CURRENCY,
-                    scheme = result.scheme,
-                    funding = result.funding,
-                    panLast4 = result.panLast4,
-                    authCode = result.authCode,
-                    processorRef = result.processorRef,
-                )
+                onEngine {
+                    engine.recordTap(
+                        amountMinor = total,
+                        currencyCode = CURRENCY,
+                        scheme = result.scheme,
+                        funding = result.funding,
+                        panLast4 = result.panLast4,
+                        authCode = result.authCode,
+                        processorRef = result.processorRef,
+                    )
+                }
                 checkout(listOf(
                     mapOf(
                         "method" to "card_tap",
@@ -146,11 +165,12 @@ class PosViewModel : ViewModel() {
         }
         viewModelScope.launch {
             try {
+                val idempotencyKey = onEngine { engine.newIdempotencyKey() }
                 val request = JSONObject()
                     .put("phone", customerPhone)
                     .put("amount_minor", total)
                     .put("currency_code", CURRENCY)
-                    .put("idempotency_key", engine.newIdempotencyKey())
+                    .put("idempotency_key", idempotencyKey)
                 val push = withContext(Dispatchers.IO) {
                     apiClient.post("/api/v1/payments/mpesa/stkpush", request)
                 }
@@ -204,40 +224,53 @@ class PosViewModel : ViewModel() {
             _lastMessage.value = "Cart is empty"
             return
         }
-        checkout(listOf(
-            mapOf(
-                "method" to "cash",
-                "amount_minor" to total,
-                "reference" to "cash_${System.currentTimeMillis()}",
-            )
-        ))
+        viewModelScope.launch {
+            checkout(listOf(
+                mapOf(
+                    "method" to "cash",
+                    "amount_minor" to total,
+                    "reference" to "cash_${System.currentTimeMillis()}",
+                )
+            ))
+        }
     }
 
-    private fun checkout(legs: List<Map<String, Any>>) {
-        viewModelScope.launch {
-            runCatching {
-                val json = org.json.JSONArray(legs.map { org.json.JSONObject(it) })
-                    .toString()
-                engine.checkout(json, engine.newIdempotencyKey())
-            }.onSuccess { saleId ->
-                _lastMessage.value = "Sale complete: ${saleId.take(8)}"
-                refreshCart()
-                syncNow()
-            }.onFailure { _lastMessage.value = it.message }
+    private suspend fun checkout(legs: List<Map<String, Any>>) {
+        try {
+            val json = org.json.JSONArray(legs.map { org.json.JSONObject(it) })
+                .toString()
+            val idempotencyKey = onEngine { engine.newIdempotencyKey() }
+            val saleId = onEngine { engine.checkout(json, idempotencyKey) }
+            _lastMessage.value = "Sale complete: ${saleId.take(8)}"
+            refreshCart()
+            syncNowInternal()
+        } catch (e: Exception) {
+            _lastMessage.value = e.message
         }
     }
 
     fun syncNow() {
-        viewModelScope.launch {
-            runCatching { engine.syncPending() }
-                .onSuccess { n -> if (n > 0u) _lastMessage.value = "Synced $n records" }
-                .onFailure { _lastMessage.value = "Sync failed: ${it.message}" }
+        viewModelScope.launch { syncNowInternal() }
+    }
+
+    private suspend fun syncNowInternal() {
+        try {
+            val synced = onEngine { engine.syncPending() }
+            if (synced > 0u) _lastMessage.value = "Synced $synced records"
+        } catch (e: Exception) {
+            _lastMessage.value = "Sync failed: ${e.message}"
         }
     }
 
-    private fun refreshCart() {
-        _cartSummary.value = engine.cartSummary()
-        _cartTotalMinor.value = runCatching { engine.cartTotalMinor() }.getOrDefault(0L)
+    private suspend fun refreshCart() {
+        try {
+            val summary = onEngine { engine.cartSummary() }
+            val total = onEngine { engine.cartTotalMinor() }
+            _cartSummary.value = summary
+            _cartTotalMinor.value = total
+        } catch (e: Exception) {
+            _lastMessage.value = e.message
+        }
     }
 
     companion object {
