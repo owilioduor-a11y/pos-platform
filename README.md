@@ -48,6 +48,8 @@ Environment variables take precedence over `-P` properties. Debug builds work ou
 
 Release builds **fail closed**: `validateReleaseConfig` runs before resource processing and rejects missing values, plaintext `http://` URLs, the `dev-token` placeholder, short tokens, and non-UUID merchant IDs. The app repeats those checks at startup, so a misconfigured release APK cannot silently talk to a development backend.
 
+TLS is also enforced by the OS: `src/main/res/xml/network_security_config.xml` blocks cleartext and trusts only system CAs. The debug source set overlays it to allow the emulator's `http://10.0.2.2:8080` backend.
+
 ```bash
 POS_SERVER_URL=https://pos.example.com \
 POS_API_TOKEN='eyJ...' \
