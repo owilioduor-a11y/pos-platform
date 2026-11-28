@@ -93,6 +93,11 @@ pub async fn sync_sales(
             record_result(&mut results, &mut rejected, item.id, "rejected");
             continue;
         }
+        if sale.items.iter().any(|line| line.quantity == 0) {
+            tracing::warn!(sale_id = %sale.id, "sale contains a zero-quantity line");
+            record_result(&mut results, &mut rejected, item.id, "rejected");
+            continue;
+        }
 
         match insert_sale(&pool, &sale, user.merchant_id, user.user_id).await {
             Ok(true) => record_result(&mut results, &mut accepted, item.id, "accepted"),
@@ -179,6 +184,59 @@ async fn insert_sale(
 
     if result.rows_affected() == 0 {
         return Ok(false);
+    }
+
+    // The server is the stock authority. A sale cannot make cloud stock
+    // negative, and the UNIQUE sale key prevents a retry from deducting twice.
+    for item in &sale.items {
+        let quantity = i64::from(item.quantity);
+        let tracked_stock = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT stock_qty FROM products
+             WHERE id = $1 AND merchant_id = $2 AND active = TRUE",
+        )
+        .bind(item.product.id)
+        .bind(merchant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("unknown product for SKU {}", item.product.sku))
+        })?;
+        // NULL means stock is not tracked for this product.
+        if let Some(available) = tracked_stock {
+            if available < quantity {
+                return Err(ApiError::BadRequest(format!(
+                    "insufficient stock for SKU {}",
+                    item.product.sku
+                )));
+            }
+            let updated = sqlx::query(
+                "UPDATE products
+                 SET stock_qty = stock_qty - $1, updated_at = now()
+                 WHERE id = $2 AND merchant_id = $3 AND active = TRUE
+                   AND stock_qty IS NOT NULL AND stock_qty >= $1",
+            )
+            .bind(quantity)
+            .bind(item.product.id)
+            .bind(merchant_id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                return Err(ApiError::BadRequest(format!(
+                    "stock changed while syncing SKU {}",
+                    item.product.sku
+                )));
+            }
+            sqlx::query(
+                "INSERT INTO stock_movements (merchant_id, sale_id, product_id, quantity)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(merchant_id)
+            .bind(sale.id)
+            .bind(item.product.id)
+            .bind(quantity)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     for payment in &sale.payments {
