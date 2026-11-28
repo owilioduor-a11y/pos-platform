@@ -10,6 +10,11 @@ internal class ApiClient(
     private val baseUrl: String,
     private val token: String,
 ) {
+    companion object {
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val READ_TIMEOUT_MS = 15_000
+    }
+
     fun post(path: String, body: JSONObject): JSONObject = request("POST", path, body.toString())
 
     fun get(path: String): JSONObject = request("GET", path, null)
@@ -17,18 +22,26 @@ internal class ApiClient(
     private fun request(method: String, path: String, body: String?): JSONObject {
         val connection = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
         connection.requestMethod = method
+        connection.connectTimeout = CONNECT_TIMEOUT_MS
+        connection.readTimeout = READ_TIMEOUT_MS
+        // Never replay a long-lived bearer token to a redirect target.
+        connection.instanceFollowRedirects = false
         connection.setRequestProperty("Authorization", "Bearer $token")
         connection.setRequestProperty("Accept", "application/json")
-        if (body != null) {
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.doOutput = true
-            connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code: Int
+        val text: String
+        try {
+            if (body != null) {
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.doOutput = true
+                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            }
+            code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        } finally {
+            connection.disconnect()
         }
-
-        val code = connection.responseCode
-        val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-        val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        connection.disconnect()
 
         if (code !in 200..299) {
             throw IOException("HTTP $code: ${errorMessage(text)}")
