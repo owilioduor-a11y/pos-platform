@@ -10,6 +10,23 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Constant-time HMAC verification. A malformed signature is simply invalid,
+/// not a distinct error a caller could use to probe the comparison.
+fn verify_hmac(secret: &str, headers: &[(String, String)], body: &[u8]) -> DomainResult<bool> {
+    let signature = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-signature"))
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(|| DomainError::PaymentDeclined("missing x-signature".into()))?;
+    let Ok(provided) = hex::decode(signature.trim()) else {
+        return Ok(false);
+    };
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| DomainError::PaymentDeclined("bad hmac key".into()))?;
+    mac.update(body);
+    Ok(mac.verify_slice(&provided).is_ok())
+}
+
 /// Server-side adapter for Kenyan card acquirers / SoftPOS backends.
 /// When `KENYA_ACQUIRER_PROVIDER=mock` (or no API URL is configured) it
 /// returns synthetic approved receipts so the full sale flow can be
@@ -165,16 +182,45 @@ impl PaymentGateway for CardAcquirerClient {
             tracing::warn!("acquirer webhook accepted without signature (no secret configured)");
             return Ok(true);
         }
-        let signature = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-signature"))
-            .map(|(_, v)| v.as_str())
-            .ok_or_else(|| DomainError::PaymentDeclined("missing x-signature".into()))?;
+        verify_hmac(&self.webhook_secret, headers, body)
+    }
+}
 
-        let mut mac = HmacSha256::new_from_slice(self.webhook_secret.as_bytes())
-            .map_err(|_| DomainError::PaymentDeclined("bad hmac key".into()))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(signature: &str) -> Vec<(String, String)> {
+        vec![("X-Signature".into(), signature.into())]
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
-        let expected = hex::encode(mac.finalize().into_bytes());
-        Ok(expected == signature)
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn hmac_verify_accepts_valid_signature() {
+        let body = br#"{"id":"evt_1"}"#;
+        let signature = sign("secret", body);
+        assert!(verify_hmac("secret", &headers(&signature), body).unwrap());
+        assert!(verify_hmac("secret", &headers(&signature.to_ascii_uppercase()), body).unwrap());
+    }
+
+    #[test]
+    fn hmac_verify_rejects_wrong_or_malformed_signature() {
+        let body = br#"{"id":"evt_1"}"#;
+        let mut signature = sign("secret", body);
+        let wrong = if signature.starts_with('0') { '1' } else { '0' };
+        signature.replace_range(0..1, &wrong.to_string());
+        assert!(!verify_hmac("secret", &headers(&signature), body).unwrap());
+        assert!(!verify_hmac("secret", &headers("not-hex"), body).unwrap());
+        assert!(!verify_hmac("secret", &headers("00"), body).unwrap());
+    }
+
+    #[test]
+    fn hmac_verify_requires_signature_header() {
+        assert!(verify_hmac("secret", &[], br#"{"id":"evt_1"}"#).is_err());
     }
 }
