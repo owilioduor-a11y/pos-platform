@@ -24,6 +24,15 @@ pub struct UpsertProductRequest {
     pub active: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateStockRequest {
+    /// New absolute count from the caller's physical count.
+    pub stock_qty: i64,
+    /// Count the caller saw before editing. Prevents stale writes from
+    /// overwriting sales that synced in the meantime.
+    pub expected_stock_qty: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProductResponse {
     pub id: String,
@@ -151,31 +160,49 @@ pub async fn upsert_product(
     Ok(Json(row_to_product(&row)?))
 }
 
-/// PATCH /api/v1/catalog/products/:id/stock — adjust stock after a sale or
-/// manual count. Offline stock deltas arrive here via sync events later.
+/// PATCH /api/v1/catalog/products/:id/stock — manual count with optimistic
+/// concurrency control. A stale absolute count cannot overwrite stock changes
+/// already applied by synced sales.
 pub async fn update_stock(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<Uuid>,
-    Json(body): Json<serde_json::Value>,
+    Json(req): Json<UpdateStockRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let pool = state.pool.clone();
-    let qty = body
-        .get("stock_qty")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| ApiError::BadRequest("stock_qty required".into()))?;
-    validate_stock_qty(Some(qty))?;
+    validate_stock_qty(Some(req.stock_qty))?;
+    validate_stock_qty(Some(req.expected_stock_qty))?;
+
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT stock_qty FROM products WHERE id = $1 AND merchant_id = $2")
+            .bind(id)
+            .bind(user.merchant_id)
+            .fetch_optional(&pool)
+            .await?
+            .flatten();
+    if current.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    if current != Some(req.expected_stock_qty) {
+        return Err(ApiError::Conflict(
+            "stock changed since it was read; refresh and retry".into(),
+        ));
+    }
+
     let result = sqlx::query(
         "UPDATE products SET stock_qty = $1, updated_at = now()
-         WHERE id = $2 AND merchant_id = $3",
+         WHERE id = $2 AND merchant_id = $3 AND stock_qty = $4",
     )
-    .bind(qty)
+    .bind(req.stock_qty)
     .bind(id)
     .bind(user.merchant_id)
+    .bind(req.expected_stock_qty)
     .execute(&pool)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
+        return Err(ApiError::Conflict(
+            "stock changed since it was read; refresh and retry".into(),
+        ));
     }
     Ok(Json(json!({ "updated": true })))
 }
