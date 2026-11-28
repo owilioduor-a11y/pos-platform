@@ -2,8 +2,12 @@ use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use axum::extract::State;
 use axum::Json;
-use pos_domain::sale::{Sale, SplitPayment};
+use pos_domain::catalog::Product;
+use pos_domain::money::{Currency, Money};
+use pos_domain::sale::{Cart, Sale, SaleTotals, SplitPayment};
+use pos_domain::tax::{TaxEngine, TaxMode};
 use pos_domain::PaymentMethod;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -184,6 +188,106 @@ fn card_tap_status(
     Ok("approved")
 }
 
+fn totals_match(expected: &SaleTotals, actual: &SaleTotals) -> bool {
+    expected.net.amount_minor == actual.net.amount_minor
+        && expected.tax.amount_minor == actual.tax.amount_minor
+        && expected.gross.amount_minor == actual.gross.amount_minor
+        && expected.net.currency.code == actual.net.currency.code
+        && expected.tax.currency.code == actual.tax.currency.code
+        && expected.gross.currency.code == actual.gross.currency.code
+}
+
+/// A device cannot invent prices or tax rates. Recompute the sale from the
+/// cloud catalog inside the sale transaction so a compromised or stale client
+/// cannot book a sale for less than the products are worth.
+async fn validate_sale_pricing(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sale: &Sale,
+    merchant_id: Uuid,
+) -> ApiResult<()> {
+    let merchant_code: String =
+        sqlx::query_scalar("SELECT currency_code FROM merchants WHERE id = $1")
+            .bind(merchant_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let merchant_currency = Currency::new(&merchant_code, 2, "")?;
+    if sale.totals.gross.currency.code != merchant_currency.code {
+        return Err(ApiError::BadRequest(
+            "sale currency does not match the merchant currency".into(),
+        ));
+    }
+
+    let engine = TaxEngine::kenya_vat(TaxMode::Inclusive);
+    let mut expected_cart = Cart::new();
+    for line in &sale.items {
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT price_minor, currency, tax_rate::text
+             FROM products
+             WHERE id = $1 AND merchant_id = $2 AND active = TRUE",
+        )
+        .bind(line.product.id)
+        .bind(merchant_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (price_minor, currency_code, tax_rate_raw) = row.ok_or_else(|| {
+            ApiError::BadRequest(format!("unknown product for SKU {}", line.product.sku))
+        })?;
+        let tax_rate = tax_rate_raw
+            .parse::<Decimal>()
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("invalid stored tax rate: {e}")))?;
+        let currency = Currency::new(&currency_code, 2, "")?;
+        if currency.code != merchant_currency.code {
+            return Err(ApiError::BadRequest(format!(
+                "product {} uses a different currency than the merchant",
+                line.product.sku
+            )));
+        }
+        if line.product.price.amount_minor != price_minor
+            || line.product.price.currency.code != currency.code
+            || line.product.tax_rate != tax_rate
+        {
+            return Err(ApiError::BadRequest(format!(
+                "catalog price or tax rate changed for SKU {}",
+                line.product.sku
+            )));
+        }
+        let server_product = Product {
+            id: line.product.id,
+            merchant_id,
+            sku: line.product.sku.clone(),
+            barcode: line.product.barcode.clone(),
+            name: line.product.name.clone(),
+            price: Money::new(price_minor, currency)?,
+            tax_rate,
+            stock_qty: None,
+            active: true,
+        };
+        expected_cart.add_product(server_product, line.quantity)?;
+    }
+
+    if let Some(ad_hoc) = &sale.ad_hoc_amount {
+        if ad_hoc.currency.code != merchant_currency.code {
+            return Err(ApiError::BadRequest(
+                "ad-hoc amount uses a different currency than the merchant".into(),
+            ));
+        }
+        expected_cart.set_adhoc(ad_hoc.clone())?;
+    }
+
+    if expected_cart.is_empty() {
+        return Err(ApiError::BadRequest(
+            "sale contains no sellable lines".into(),
+        ));
+    }
+    let expected = expected_cart.totals(&engine)?;
+    if !totals_match(&expected, &sale.totals) {
+        return Err(ApiError::BadRequest(
+            "sale totals do not match server catalog prices".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Insert a sale + its payment legs atomically.
 /// Returns false on idempotency conflict, with no partial rows written.
 async fn insert_sale(
@@ -211,6 +315,8 @@ async fn insert_sale(
     if result.rows_affected() == 0 {
         return Ok(false);
     }
+
+    validate_sale_pricing(&mut tx, sale, merchant_id).await?;
 
     // The server is the stock authority. A sale cannot make cloud stock
     // negative, and the UNIQUE sale key prevents a retry from deducting twice.
@@ -408,6 +514,14 @@ mod tests {
         .unwrap()
     }
 
+    fn totals(gross: i64, tax: i64, net: i64) -> SaleTotals {
+        SaleTotals {
+            gross: Money::new(gross, Currency::kes()).unwrap(),
+            tax: Money::new(tax, Currency::kes()).unwrap(),
+            net: Money::new(net, Currency::kes()).unwrap(),
+        }
+    }
+
     fn card_leg(amount_minor: i64, currency: Currency) -> SplitPayment {
         SplitPayment::new(
             PaymentMethod::CardTap,
@@ -461,6 +575,19 @@ mod tests {
             "processor_ref": "other_ref",
         });
         assert!(card_tap_status(Some(wrong_ref), &leg).is_err());
+    }
+
+    #[test]
+    fn totals_match_rejects_tampered_amounts_and_currency() {
+        let expected = totals(11_600, 1_600, 10_000);
+        assert!(totals_match(&expected, &totals(11_600, 1_600, 10_000)));
+        assert!(!totals_match(&expected, &totals(1_160, 1_600, 10_000)));
+        assert!(!totals_match(&expected, &totals(11_600, 100, 10_000)));
+        assert!(!totals_match(&expected, &totals(11_600, 1_600, 1_000)));
+
+        let mut wrong_currency = totals(11_600, 1_600, 10_000);
+        wrong_currency.gross.currency = Currency::usd();
+        assert!(!totals_match(&expected, &wrong_currency));
     }
 
     #[test]
