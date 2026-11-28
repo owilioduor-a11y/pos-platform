@@ -69,7 +69,9 @@ impl CardAcquirerClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer charge: {e}")))?;
+            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer charge: {e}")))?
+            .error_for_status()
+            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer charge status: {e}")))?;
 
         let payload: Value = resp
             .json()
@@ -152,7 +154,9 @@ impl PaymentGateway for CardAcquirerClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer refund: {e}")))?;
+            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer refund: {e}")))?
+            .error_for_status()
+            .map_err(|e| DomainError::PaymentDeclined(format!("acquirer refund status: {e}")))?;
         let payload: Value = resp
             .json()
             .await

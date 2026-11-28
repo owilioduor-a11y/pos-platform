@@ -66,7 +66,9 @@ impl DarajaClient {
             .basic_auth(&self.consumer_key, Some(&self.consumer_secret))
             .send()
             .await
-            .map_err(|e| DomainError::PaymentDeclined(format!("daraja oauth: {e}")))?;
+            .map_err(|e| DomainError::PaymentDeclined(format!("daraja oauth: {e}")))?
+            .error_for_status()
+            .map_err(|e| DomainError::PaymentDeclined(format!("daraja oauth status: {e}")))?;
         let body: Value = resp
             .json()
             .await
@@ -117,7 +119,9 @@ impl DarajaClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| DomainError::PaymentDeclined(format!("stk push: {e}")))?;
+            .map_err(|e| DomainError::PaymentDeclined(format!("stk push: {e}")))?
+            .error_for_status()
+            .map_err(|e| DomainError::PaymentDeclined(format!("stk push status: {e}")))?;
 
         let payload: Value = resp
             .json()
