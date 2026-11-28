@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::gateways::daraja;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +58,15 @@ fn money_from(req_currency: &Option<String>, amount_minor: i64) -> ApiResult<Mon
         .to_ascii_uppercase();
     let currency = Currency::new(&code, 2, "").map_err(ApiError::from)?;
     Money::new(amount_minor, currency).map_err(ApiError::from)
+}
+
+fn validate_mpesa_amount(amount: &Money) -> ApiResult<()> {
+    if amount.currency.code != "KES" {
+        return Err(ApiError::BadRequest("M-Pesa only supports KES".into()));
+    }
+    daraja::whole_kes_amount(amount.amount_minor)
+        .map(|_| ())
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 fn parse_idempotency_key(raw: &str) -> ApiResult<Uuid> {
@@ -169,6 +179,9 @@ fn callback_matches_intent(
 ) -> bool {
     if callback.result_code != 0 {
         return true;
+    }
+    if intent_amount_minor <= 0 || intent_amount_minor % 100 != 0 {
+        return false;
     }
     if callback.receipt_number.is_none() {
         return false;
@@ -387,6 +400,9 @@ pub async fn charge(
     if amount.amount_minor <= 0 {
         return Err(ApiError::BadRequest("amount must be positive".into()));
     }
+    if method == PaymentMethod::Mpesa {
+        validate_mpesa_amount(&amount)?;
+    }
     let idempotency_key = parse_idempotency_key(&req.idempotency_key)?;
     let fingerprint = request_fingerprint(
         method,
@@ -443,6 +459,7 @@ pub async fn mpesa_stkpush(
     if amount.amount_minor <= 0 {
         return Err(ApiError::BadRequest("amount must be positive".into()));
     }
+    validate_mpesa_amount(&amount)?;
     let idempotency_key = parse_idempotency_key(&req.idempotency_key)?;
     let account_ref = req
         .account_ref
@@ -704,6 +721,13 @@ mod tests {
     use pos_domain::money::Currency;
 
     #[test]
+    fn mpesa_amount_must_be_whole_kes() {
+        assert!(validate_mpesa_amount(&Money::new(100_000, Currency::kes()).unwrap()).is_ok());
+        assert!(validate_mpesa_amount(&Money::new(100_050, Currency::kes()).unwrap()).is_err());
+        assert!(validate_mpesa_amount(&Money::new(100_000, Currency::usd()).unwrap()).is_err());
+    }
+
+    #[test]
     fn idempotency_key_must_be_uuid7() {
         let v7 = Uuid::now_v7().to_string();
         assert!(parse_idempotency_key(&v7).is_ok());
@@ -839,6 +863,11 @@ mod tests {
         assert!(!callback_matches_intent(
             &success_callback(None, Some("254712345678"), true),
             100_000,
+            "****5678"
+        ));
+        assert!(!callback_matches_intent(
+            &success_callback(Some(1000), Some("254712345678"), true),
+            100_050,
             "****5678"
         ));
     }

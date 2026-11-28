@@ -18,6 +18,23 @@ pub struct DarajaClient {
     callback_url: String,
 }
 
+/// Daraja's `Amount` field is whole KES. Reject sub-shilling amounts instead
+/// of silently truncating them, which would make the callback disagree with
+/// the stored intent.
+pub fn whole_kes_amount(amount_minor: i64) -> DomainResult<i64> {
+    if amount_minor <= 0 {
+        return Err(DomainError::PaymentDeclined(
+            "amount must be positive".into(),
+        ));
+    }
+    if amount_minor % 100 != 0 {
+        return Err(DomainError::PaymentDeclined(
+            "M-Pesa amounts must be whole KES".into(),
+        ));
+    }
+    Ok(amount_minor / 100)
+}
+
 impl DarajaClient {
     pub fn new(config: &Config) -> Self {
         let base_url = if config.daraja_env.eq_ignore_ascii_case("production") {
@@ -76,8 +93,7 @@ impl DarajaClient {
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
         let password = base64::engine::general_purpose::STANDARD
             .encode(format!("{}{}{}", self.shortcode, self.passkey, timestamp));
-        // Daraja expects whole KES for STK push amounts.
-        let amount_kes = req.amount.amount_minor / 100;
+        let amount_kes = whole_kes_amount(req.amount.amount_minor)?;
 
         let body = json!({
             "BusinessShortCode": self.shortcode,
@@ -163,5 +179,18 @@ impl PaymentGateway for DarajaClient {
         // Parse check ensures we only ack well-formed callbacks.
         let parsed: Result<Value, _> = serde_json::from_slice(body);
         Ok(parsed.is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daraja_amounts_must_be_whole_kes() {
+        assert_eq!(whole_kes_amount(100_000).unwrap(), 1000);
+        assert!(whole_kes_amount(100_050).is_err());
+        assert!(whole_kes_amount(0).is_err());
+        assert!(whole_kes_amount(-100).is_err());
     }
 }
