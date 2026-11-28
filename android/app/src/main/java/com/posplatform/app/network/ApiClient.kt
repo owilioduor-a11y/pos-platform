@@ -9,6 +9,9 @@ import org.json.JSONObject
 internal class ApiClient(
     private val baseUrl: String,
     private val token: String,
+    private val openConnection: (String) -> HttpURLConnection = { url ->
+        URL(url).openConnection() as HttpURLConnection
+    },
 ) {
     companion object {
         private const val CONNECT_TIMEOUT_MS = 10_000
@@ -20,7 +23,7 @@ internal class ApiClient(
     fun get(path: String): JSONObject = request("GET", path, null)
 
     private fun request(method: String, path: String, body: String?): JSONObject {
-        val connection = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
+        val connection = openConnection(baseUrl.trimEnd('/') + path)
         connection.requestMethod = method
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
