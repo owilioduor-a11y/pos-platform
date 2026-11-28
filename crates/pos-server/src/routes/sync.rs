@@ -121,7 +121,8 @@ struct StkIntentStatus {
 }
 
 /// A client-supplied checkout id only counts as evidence of payment when the
-/// intent belongs to the authenticated merchant and matches the leg exactly.
+/// intent belongs to this sale attempt, matches the leg exactly, and has
+/// settled. Unsettled or already-consumed intents are not sale evidence.
 fn mpesa_payment_status(
     intent: Option<StkIntentStatus>,
     sale_idempotency_key: Uuid,
@@ -143,11 +144,13 @@ fn mpesa_payment_status(
             "M-Pesa intent does not match the payment leg".into(),
         ));
     }
-    Ok(match intent.status.as_str() {
-        "completed" => "approved",
-        "failed" => "failed",
-        _ => "pending",
-    })
+    match intent.status.as_str() {
+        "completed" => Ok("approved"),
+        "failed" => Err(ApiError::BadRequest("M-Pesa intent failed".into())),
+        _ => Err(ApiError::BadRequest(
+            "M-Pesa intent has not completed".into(),
+        )),
+    }
 }
 
 /// Insert a sale + its payment legs atomically.
@@ -179,13 +182,17 @@ async fn insert_sale(
     }
 
     for payment in &sale.payments {
-        // M-Pesa STK Push is confirmed asynchronously; carry the reconciled
-        // intent status forward if a callback already arrived.
+        // Claim the STK intent inside the sale transaction. Only a settled
+        // intent with an unconsumed checkout id can back a completed sale.
         let status = if payment.method == PaymentMethod::Mpesa {
             let intent = sqlx::query_as::<_, (String, Uuid, i64, String)>(
-                "SELECT status, idempotency_key, amount_minor, currency FROM mpesa_stk_intents
-                 WHERE checkout_request_id = $1 AND merchant_id = $2",
+                "UPDATE mpesa_stk_intents
+                 SET consumed_by_sale_id = $1, consumed_at = now()
+                 WHERE checkout_request_id = $2 AND merchant_id = $3
+                   AND consumed_by_sale_id IS NULL
+                 RETURNING status, idempotency_key, amount_minor, currency",
             )
+            .bind(sale.id)
             .bind(&payment.reference)
             .bind(merchant_id)
             .fetch_optional(&mut *tx)
@@ -299,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn mpesa_leg_status_comes_from_matching_intent() {
+    fn mpesa_leg_requires_a_settled_matching_intent() {
         let leg = mpesa_leg(100_000, Currency::kes());
         let key = Uuid::now_v7();
         assert_eq!(
@@ -307,13 +314,11 @@ mod tests {
                 .unwrap(),
             "approved"
         );
-        assert_eq!(
-            mpesa_payment_status(Some(intent("failed", key, 100_000, "KES")), key, &leg).unwrap(),
-            "failed"
+        assert!(
+            mpesa_payment_status(Some(intent("failed", key, 100_000, "KES")), key, &leg).is_err()
         );
-        assert_eq!(
-            mpesa_payment_status(Some(intent("pending", key, 100_000, "KES")), key, &leg).unwrap(),
-            "pending"
+        assert!(
+            mpesa_payment_status(Some(intent("pending", key, 100_000, "KES")), key, &leg).is_err()
         );
     }
 
